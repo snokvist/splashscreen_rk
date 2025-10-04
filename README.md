@@ -22,7 +22,9 @@ sudo apt-get install -y \
 
 Once the dependencies are present, build the project with `make`. The default
 rule compiles the CLI and HTTP control application as well as the supporting
-`splashlib` GStreamer wrapper.
+`splashlib` GStreamer wrapper. The build also unpacks the demo
+`spinner_ai_1080p30.h265` stream from the checked-in ZIP archive so the sample
+configuration can run immediately.
 
 ## Configuration
 
