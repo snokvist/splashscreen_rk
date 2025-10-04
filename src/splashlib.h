@@ -29,6 +29,7 @@ typedef struct {
   const char *input_path;   // Annex-B H.265 elementary stream (AUD+VUI recommended)
   double fps;               // e.g., 30.0
   SplashEndpoint endpoint;  // UDP host+port
+  SplashEndpoint secondary_endpoint;  // optional secondary UDP host+port (port<=0 disables)
 } SplashConfig;
 
 // Event callback (optional)
@@ -96,6 +97,9 @@ int  splash_find_index_by_name(Splash *s, const char *name);
 
 // Logging / events
 void splash_set_event_cb(Splash *s, SplashEventCb cb, void *user);
+
+// Runtime control helpers
+void splash_select_endpoint(Splash *s, gboolean use_secondary);
 
 #ifdef __cplusplus
 }

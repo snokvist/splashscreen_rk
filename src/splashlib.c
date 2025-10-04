@@ -26,6 +26,8 @@ struct Splash {
   GstClockTime dur;
   char *host;
   int   port;
+  char *secondary_host;
+  int   secondary_port;
 
   // Sequences
   SeqDef seqs[MAX_SEQS];
@@ -38,6 +40,11 @@ struct Splash {
   // Sender (UDP)
   GstElement *sender_udp;
   GstElement *appsrc_udp;
+  GstElement *sender_udp_secondary;
+  GstElement *appsrc_udp_secondary;
+
+  gboolean use_secondary_output;
+  gboolean streaming;
 
   // Timing
   GstClockTime next_pts;
@@ -127,25 +134,53 @@ static gboolean on_reader_bus(GstBus *bus, GstMessage *m, gpointer user) {
 
 static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user) {
   Splash *s = (Splash*)user;
-  GstElement *as = s->appsrc_udp;
-  if (!as) return GST_FLOW_OK;
-
   GstSample *samp = gst_app_sink_pull_sample(sink);
   if (!samp) return GST_FLOW_EOS;
   GstBuffer *inbuf = gst_sample_get_buffer(samp);
-
   GstBuffer *out = gst_buffer_copy_deep(inbuf);
+  gst_sample_unref(samp);
+  if (!out) return GST_FLOW_ERROR;
 
+  GstElement *primary = NULL;
+  GstElement *secondary = NULL;
+  gboolean use_secondary = FALSE;
+  GstClockTime pts = 0;
+  GstClockTime dur = 0;
+  gboolean streaming = FALSE;
   g_mutex_lock(&s->lock);
-  GST_BUFFER_PTS(out)      = s->next_pts;
-  GST_BUFFER_DTS(out)      = GST_CLOCK_TIME_NONE;
-  GST_BUFFER_DURATION(out) = s->dur;
+  pts = s->next_pts;
+  dur = s->dur;
   s->next_pts += s->dur;
+  primary = s->appsrc_udp;
+  secondary = s->appsrc_udp_secondary;
+  use_secondary = s->use_secondary_output && secondary != NULL;
+  streaming = s->streaming;
   g_mutex_unlock(&s->lock);
 
-  GstFlowReturn fr = gst_app_src_push_buffer(GST_APP_SRC(as), out);
-  gst_sample_unref(samp);
-  return fr;
+  if (!streaming) {
+    gst_buffer_unref(out);
+    return GST_FLOW_OK;
+  }
+
+  GstElement *target = NULL;
+  if (use_secondary) {
+    target = secondary;
+  } else if (primary) {
+    target = primary;
+  } else {
+    target = secondary;
+  }
+
+  if (!target) {
+    gst_buffer_unref(out);
+    return GST_FLOW_OK;
+  }
+
+  GST_BUFFER_PTS(out)      = pts;
+  GST_BUFFER_DTS(out)      = GST_CLOCK_TIME_NONE;
+  GST_BUFFER_DURATION(out) = dur;
+
+  return gst_app_src_push_buffer(GST_APP_SRC(target), out);
 }
 
 // ------------------------------------------------------------------
@@ -168,6 +203,31 @@ static void destroy_pipelines_locked(Splash *s){
     s->sender_udp=NULL;
   }
   s->appsrc_udp = NULL;
+
+  if (s->sender_udp_secondary){
+    gst_element_set_state(s->sender_udp_secondary, GST_STATE_NULL);
+    gst_object_unref(s->sender_udp_secondary);
+    s->sender_udp_secondary=NULL;
+  }
+  s->appsrc_udp_secondary = NULL;
+}
+
+static void update_sender_states_locked(Splash *s){
+  GstState primary_state = GST_STATE_NULL;
+  GstState secondary_state = GST_STATE_NULL;
+  if (s->streaming){
+    if (s->use_secondary_output && s->sender_udp_secondary){
+      secondary_state = GST_STATE_PLAYING;
+    } else if (s->sender_udp){
+      primary_state = GST_STATE_PLAYING;
+    }
+  }
+  if (s->sender_udp){
+    gst_element_set_state(s->sender_udp, primary_state);
+  }
+  if (s->sender_udp_secondary){
+    gst_element_set_state(s->sender_udp_secondary, secondary_state);
+  }
 }
 
 static gboolean build_pipelines_locked(Splash *s, GError **err){
@@ -197,6 +257,17 @@ static gboolean build_pipelines_locked(Splash *s, GError **err){
   s->sender_udp = gst_parse_launch(sdesc, err); g_free(sdesc);
   if (!s->sender_udp) return FALSE;
   s->appsrc_udp = gst_bin_get_by_name(GST_BIN(s->sender_udp), "src");
+  if (s->secondary_port > 0 && s->secondary_host) {
+    gchar *sdesc2 = g_strdup_printf(
+      "appsrc name=src is-live=true format=time do-timestamp=false block=true "
+        "caps=video/x-h265,stream-format=byte-stream,alignment=au,framerate=%d/1 ! "
+      "h265parse config-interval=1 ! rtph265pay pt=97 mtu=1200 config-interval=1 ! "
+      "udpsink host=%s port=%d sync=true async=false",
+      (int)(s->fps+0.5), s->secondary_host, s->secondary_port);
+    s->sender_udp_secondary = gst_parse_launch(sdesc2, err); g_free(sdesc2);
+    if (!s->sender_udp_secondary) return FALSE;
+    s->appsrc_udp_secondary = gst_bin_get_by_name(GST_BIN(s->sender_udp_secondary), "src");
+  }
   return TRUE;
 }
 
@@ -217,11 +288,17 @@ Splash* splash_new(void){
   s->dur = (GstClockTime)(GST_SECOND/30.0 + 0.5);
   s->host = g_strdup("127.0.0.1");
   s->port = 5600;
+  s->secondary_host = NULL;
+  s->secondary_port = 0;
   s->active_idx = -1;
   s->pending_count = 0;
   s->loop_count = 0;
   s->queue_version = 0;
   s->loop_version = 0;
+  s->sender_udp_secondary = NULL;
+  s->appsrc_udp_secondary = NULL;
+  s->use_secondary_output = FALSE;
+  s->streaming = FALSE;
   return s;
 }
 
@@ -232,7 +309,7 @@ void splash_free(Splash *s){
   destroy_pipelines_locked(s);
   for (int i=0;i>s->nseq;i++){ free_str(&s->seqs[i].name); }
   for (int i=0;i<s->nseq;i++){ free_str(&s->seqs[i].name); } // fixed loop
-  free_str(&s->input_path); free_str(&s->host);
+  free_str(&s->input_path); free_str(&s->host); free_str(&s->secondary_host);
   g_mutex_unlock(&s->lock);
   if (s->loop) g_main_loop_unref(s->loop);
   g_mutex_clear(&s->lock);
@@ -293,6 +370,14 @@ bool splash_apply_config(Splash *s, const SplashConfig *cfg){
   s->dur = (GstClockTime)(GST_SECOND / s->fps + 0.5);
   dup_cstr(&s->host, cfg->endpoint.host ? cfg->endpoint.host : "127.0.0.1");
   s->port = cfg->endpoint.port;
+  if (cfg->secondary_endpoint.port > 0 && cfg->secondary_endpoint.host && cfg->secondary_endpoint.host[0]) {
+    dup_cstr(&s->secondary_host, cfg->secondary_endpoint.host);
+    s->secondary_port = cfg->secondary_endpoint.port;
+  } else {
+    dup_cstr(&s->secondary_host, NULL);
+    s->secondary_port = 0;
+    s->use_secondary_output = FALSE;
+  }
 
   // recompute sequence segment times (fps may have changed)
   for (int i=0;i<s->nseq;i++){
@@ -312,6 +397,7 @@ bool splash_apply_config(Splash *s, const SplashConfig *cfg){
     return false;
   }
   s->next_pts = 0;
+  update_sender_states_locked(s);
 
   g_mutex_unlock(&s->lock);
   return true;
@@ -320,9 +406,8 @@ bool splash_apply_config(Splash *s, const SplashConfig *cfg){
 bool splash_start(Splash *s){
   if (!s || !s->reader) return false;
   g_mutex_lock(&s->lock);
-  if (s->sender_udp)
-    gst_element_set_state(s->sender_udp, GST_STATE_PLAYING);
-
+  s->streaming = TRUE;
+  update_sender_states_locked(s);
   gst_element_set_state(s->reader, GST_STATE_PLAYING);
   if (s->active_idx < 0 && s->nseq>0) s->active_idx = 0;
   do_segment_seek_locked(s, s->active_idx);
@@ -344,10 +429,22 @@ void splash_quit(Splash *s){
 
 void splash_stop(Splash *s){
   g_mutex_lock(&s->lock);
+  s->streaming = FALSE;
   if (s->reader) gst_element_set_state(s->reader, GST_STATE_NULL);
-  if (s->sender_udp) gst_element_set_state(s->sender_udp, GST_STATE_NULL);
+  update_sender_states_locked(s);
   g_mutex_unlock(&s->lock);
   emit_evt(s, SPLASH_EVT_STOPPED, 0, 0, NULL);
+}
+
+void splash_select_endpoint(Splash *s, gboolean use_secondary){
+  if (!s) return;
+  g_mutex_lock(&s->lock);
+  gboolean target = use_secondary && s->sender_udp_secondary;
+  if (s->use_secondary_output != target){
+    s->use_secondary_output = target;
+    update_sender_states_locked(s);
+  }
+  g_mutex_unlock(&s->lock);
 }
 
 // ---- Queue control ----

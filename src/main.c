@@ -33,6 +33,18 @@ typedef struct {
   gboolean started;
   gboolean combo_loop_full;
   GMainLoop *loop;
+  SplashEndpoint primary_endpoint;
+  SplashEndpoint secondary_endpoint;
+  gboolean have_secondary_endpoint;
+  gboolean using_secondary_output;
+  GSocket *primary_probe_socket;
+  GSocket *secondary_probe_socket;
+  guint primary_probe_source_id;
+  guint secondary_probe_source_id;
+  gint64 last_primary_probe_us;
+  gint64 last_secondary_probe_us;
+  guint failover_timer_id;
+  gint64 failover_hold_us;
 } AppCtx;
 
 static gboolean set_stdin_nonblock(void) {
@@ -366,6 +378,176 @@ static void on_evt(SplashEventType type, int a, int b, const char *msg, void *us
   }
 }
 
+typedef struct {
+  AppCtx *ctx;
+  gboolean is_secondary;
+} ProbeSourceData;
+
+static GSocket *create_udp_probe_socket(guint16 port){
+  GError *error = NULL;
+  GSocket *sock = g_socket_new(G_SOCKET_FAMILY_IPV4,
+                               G_SOCKET_TYPE_DATAGRAM,
+                               G_SOCKET_PROTOCOL_UDP,
+                               &error);
+  if (!sock){
+    fprintf(stderr, "[failover] failed to create UDP probe socket for port %u: %s\n",
+            port, error ? error->message : "unknown error");
+    if (error) g_error_free(error);
+    return NULL;
+  }
+  g_socket_set_blocking(sock, FALSE);
+  GInetAddress *addr = g_inet_address_new_any(G_SOCKET_FAMILY_IPV4);
+  GSocketAddress *saddr = g_inet_socket_address_new(addr, port);
+  g_inet_address_unref(addr);
+  if (!g_socket_bind(sock, saddr, TRUE, &error)){
+    fprintf(stderr, "[failover] unable to bind UDP probe on port %u: %s\n",
+            port, error ? error->message : "unknown error");
+    if (error) g_error_free(error);
+    g_object_unref(saddr);
+    g_object_unref(sock);
+    return NULL;
+  }
+  g_object_unref(saddr);
+  return sock;
+}
+
+static gboolean probe_source_cb(GSocket *socket, GIOCondition condition, gpointer user_data){
+  ProbeSourceData *data = (ProbeSourceData*)user_data;
+  if (!data || !data->ctx) return G_SOURCE_CONTINUE;
+  if (condition & (G_IO_ERR | G_IO_HUP | G_IO_NVAL))
+    return G_SOURCE_CONTINUE;
+
+  guint8 buf[2048];
+  for (;;) {
+    GError *error = NULL;
+    gssize r = g_socket_receive(socket, (gchar*)buf, sizeof(buf), NULL, &error);
+    if (r <= 0){
+      if (error) g_error_free(error);
+      break;
+    }
+  }
+
+  gint64 now = g_get_monotonic_time();
+  if (data->is_secondary){
+    data->ctx->last_secondary_probe_us = now;
+  } else {
+    data->ctx->last_primary_probe_us = now;
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+static gboolean start_probe(AppCtx *ctx, GSocket *socket, gboolean is_secondary, guint *source_id){
+  if (!ctx || !socket || !source_id || *source_id) return FALSE;
+  GSource *src = g_socket_create_source(socket, G_IO_IN | G_IO_ERR | G_IO_HUP, NULL);
+  if (!src) return FALSE;
+  ProbeSourceData *data = g_new0(ProbeSourceData, 1);
+  data->ctx = ctx;
+  data->is_secondary = is_secondary;
+  g_source_set_callback(src, (GSourceFunc)probe_source_cb, data, g_free);
+  guint id = g_source_attach(src, NULL);
+  g_source_unref(src);
+  if (!id) return FALSE;
+  *source_id = id;
+  return TRUE;
+}
+
+static void stop_probe(guint *source_id){
+  if (source_id && *source_id){
+    g_source_remove(*source_id);
+    *source_id = 0;
+  }
+}
+
+static void ensure_secondary_probe(AppCtx *ctx, gboolean enable){
+  if (!ctx || !ctx->secondary_probe_socket) return;
+  if (enable){
+    if (!ctx->secondary_probe_source_id){
+      if (start_probe(ctx, ctx->secondary_probe_socket, TRUE, &ctx->secondary_probe_source_id)){
+        fprintf(stderr,
+                "[failover] secondary UDP port %u monitoring enabled\n",
+                ctx->secondary_endpoint.port);
+      }
+    }
+  } else {
+    if (ctx->secondary_probe_source_id){
+      stop_probe(&ctx->secondary_probe_source_id);
+      ctx->last_secondary_probe_us = 0;
+    }
+  }
+}
+
+static void update_output_target(AppCtx *ctx, gboolean use_secondary){
+  if (!ctx || !ctx->splash) return;
+  if (use_secondary && !ctx->have_secondary_endpoint) return;
+  if (ctx->using_secondary_output == use_secondary) return;
+  splash_select_endpoint(ctx->splash, use_secondary);
+  ctx->using_secondary_output = use_secondary;
+  if (use_secondary){
+    fprintf(stderr, "[failover] switched to secondary UDP port %d\n",
+            ctx->secondary_endpoint.port);
+  } else {
+    fprintf(stderr, "[failover] switched to primary UDP port %d\n",
+            ctx->primary_endpoint.port);
+  }
+}
+
+static gboolean failover_timer_cb(gpointer user_data){
+  AppCtx *ctx = (AppCtx*)user_data;
+  if (!ctx) return G_SOURCE_CONTINUE;
+  gint64 now = g_get_monotonic_time();
+  gboolean primary_recent = ctx->primary_probe_source_id &&
+                            ctx->last_primary_probe_us > 0 &&
+                            (now - ctx->last_primary_probe_us) <= ctx->failover_hold_us;
+  if (primary_recent){
+    if (ctx->have_secondary_endpoint) ensure_secondary_probe(ctx, FALSE);
+    update_output_target(ctx, FALSE);
+    return G_SOURCE_CONTINUE;
+  }
+
+  if (!ctx->have_secondary_endpoint) return G_SOURCE_CONTINUE;
+  if (!ctx->secondary_probe_socket) return G_SOURCE_CONTINUE;
+
+  ensure_secondary_probe(ctx, TRUE);
+
+  gboolean secondary_recent = ctx->last_secondary_probe_us > 0 &&
+                              (now - ctx->last_secondary_probe_us) <= ctx->failover_hold_us;
+  if (secondary_recent){
+    update_output_target(ctx, TRUE);
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+static void init_failover_monitor(AppCtx *ctx){
+  if (!ctx) return;
+  ctx->failover_hold_us = 500 * G_TIME_SPAN_MILLISECOND;
+  if (ctx->primary_endpoint.port > 0){
+    ctx->primary_probe_socket = create_udp_probe_socket(ctx->primary_endpoint.port);
+    if (ctx->primary_probe_socket){
+      if (start_probe(ctx, ctx->primary_probe_socket, FALSE, &ctx->primary_probe_source_id)){
+        fprintf(stderr, "[failover] primary UDP port %d monitoring enabled\n",
+                ctx->primary_endpoint.port);
+      } else {
+        g_object_unref(ctx->primary_probe_socket);
+        ctx->primary_probe_socket = NULL;
+      }
+    }
+  }
+
+  if (ctx->have_secondary_endpoint && ctx->secondary_endpoint.port > 0){
+    ctx->secondary_probe_socket = create_udp_probe_socket(ctx->secondary_endpoint.port);
+    if (ctx->secondary_probe_socket){
+      fprintf(stderr, "[failover] secondary UDP port %d ready (standby)\n",
+              ctx->secondary_endpoint.port);
+    } else {
+      ctx->have_secondary_endpoint = FALSE;
+    }
+  }
+
+  if (ctx->primary_probe_source_id || ctx->have_secondary_endpoint){
+    ctx->failover_timer_id = g_timeout_add(200, failover_timer_cb, ctx);
+  }
+}
+
 #define SEQ_GROUP_PREFIX "sequence"
 
 static void usage(const char *p){
@@ -660,6 +842,43 @@ static gboolean load_config(const char *path,
     goto done;
   }
 
+  cfg->secondary_endpoint.host = NULL;
+  cfg->secondary_endpoint.port = 0;
+  gboolean have_secondary = FALSE;
+  if (g_key_file_has_key(kf, "stream", "secondary_port", NULL)) {
+    error = NULL;
+    gint port_val = g_key_file_get_integer(kf, "stream", "secondary_port", &error);
+    if (error) {
+      fprintf(stderr, "Invalid stream.secondary_port: %s\n", error->message);
+      g_error_free(error);
+      goto done;
+    }
+    if (port_val > 0 && port_val <= 65535) {
+      cfg->secondary_endpoint.port = port_val;
+      have_secondary = TRUE;
+    } else if (port_val != 0) {
+      fprintf(stderr, "stream.secondary_port must be between 1 and 65535 (got %d)\n", port_val);
+      goto done;
+    }
+  }
+  if (have_secondary) {
+    gchar *sec_host = NULL;
+    if (g_key_file_has_key(kf, "stream", "secondary_host", NULL)) {
+      error = NULL;
+      sec_host = g_key_file_get_string(kf, "stream", "secondary_host", &error);
+      if (error) {
+        fprintf(stderr, "Invalid stream.secondary_host: %s\n", error->message);
+        g_error_free(error);
+        goto done;
+      }
+    }
+    if (!sec_host) {
+      sec_host = g_strdup(host);
+    }
+    g_ptr_array_add(owned_strings, sec_host);
+    cfg->secondary_endpoint.host = sec_host;
+  }
+
   guint16 control_port = 8081;
   if (g_key_file_has_key(kf, "control", "port", NULL)) {
     error = NULL;
@@ -927,6 +1146,12 @@ int main(int argc, char **argv){
   ctx.started = FALSE;
   ctx.combo_loop_full = combo_loop_full;
   ctx.loop = g_main_loop_new(NULL, FALSE);
+  ctx.primary_endpoint = cfg.endpoint;
+  ctx.secondary_endpoint = cfg.secondary_endpoint;
+  ctx.have_secondary_endpoint = (cfg.secondary_endpoint.port > 0 &&
+                                 cfg.secondary_endpoint.host &&
+                                 cfg.secondary_endpoint.host[0] != '\0');
+  ctx.using_secondary_output = FALSE;
 
   splash_set_event_cb(S, on_evt, &ctx);
 
@@ -949,6 +1174,7 @@ int main(int argc, char **argv){
     g_ptr_array_free(owned_strings, TRUE);
     return 1;
   }
+  splash_select_endpoint(S, FALSE);
   if (!splash_start(S)) {
     fprintf(stderr, "Failed to start\n");
     if (ctx.loop) g_main_loop_unref(ctx.loop);
@@ -959,6 +1185,7 @@ int main(int argc, char **argv){
     return 1;
   }
   ctx.started = TRUE;
+  init_failover_monitor(&ctx);
 
   GSocketService *http_service = g_socket_service_new();
   g_signal_connect(http_service, "incoming", G_CALLBACK(on_http_client), &ctx);
@@ -1037,6 +1264,11 @@ int main(int argc, char **argv){
   if (stdin_chan) g_io_channel_unref(stdin_chan);
 
   if (ctx.started) splash_stop(S);
+  if (ctx.failover_timer_id) g_source_remove(ctx.failover_timer_id);
+  if (ctx.secondary_probe_source_id) g_source_remove(ctx.secondary_probe_source_id);
+  if (ctx.primary_probe_source_id) g_source_remove(ctx.primary_probe_source_id);
+  if (ctx.secondary_probe_socket) g_object_unref(ctx.secondary_probe_socket);
+  if (ctx.primary_probe_socket) g_object_unref(ctx.primary_probe_socket);
   if (http_service) {
     g_socket_service_stop(http_service);
     g_object_unref(http_service);

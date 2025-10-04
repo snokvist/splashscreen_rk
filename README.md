@@ -38,6 +38,12 @@ illustrates every available section:
   - `fps`: Frame rate of the input material (double).
   - `host`: Destination IP for the RTP/UDP output.
   - `port`: Destination UDP port.
+  - `secondary_host`: Optional destination IP for a standby output. Defaults to
+    `host` when omitted but `secondary_port` is provided.
+  - `secondary_port`: Optional fallback UDP port. When configured, the primary
+    `port` remains active while traffic is present; packets on the secondary
+    port are discarded until the primary stream falls silent, at which point the
+    secondary output is enabled automatically.
 - `[control]`
   - `port`: HTTP control port (defaults to `8081` if omitted).
   - `combo_loop_mode`: Controls how combo playlists repeat once the queue drains.
@@ -62,6 +68,13 @@ When CLI mode is enabled (`--cli`), press `1-9` to enqueue individual sequences,
 `c` to clear the queue, `s` to start, `x` to stop, and `q` to quit. All control
 features are also available over HTTP via `GET /request/{start,stop,list}` and
 `GET /request/enqueue/<name>` for sequences or combos.
+
+The runtime monitors the configured UDP ports to provide seamless failover. As
+long as datagrams are observed on the primary port, the program streams only to
+that destination and ignores the secondary port to avoid unnecessary CPU load.
+If the primary stream stops for a brief period, the secondary socket is enabled
+and the application automatically switches its UDP output to the secondary
+destination as soon as packets arrive there.
 
 ## Preparing H.265 Inputs
 
