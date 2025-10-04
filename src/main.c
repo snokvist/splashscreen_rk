@@ -641,7 +641,7 @@ static gboolean load_config(const char *path,
 
   GArray *seq_array = g_array_new(FALSE, FALSE, sizeof(SplashSeq));
   if (!seq_array) goto done;
-  GPtrArray *combo_defs = g_ptr_array_new_with_free_func((GDestroyNotify)pending_combo_free);
+  combo_defs = g_ptr_array_new_with_free_func((GDestroyNotify)pending_combo_free);
   if (!combo_defs) {
     g_array_free(seq_array, TRUE);
     goto done;
