@@ -284,10 +284,12 @@ static void usage(const char *p){
     "  fps=30.0\n"
     "  host=127.0.0.1\n"
     "  port=5600\n"
-    "and one or more [sequence NAME] groups defining start/end frames.\n\n"
+    "and one or more [sequence NAME] groups defining start/end frames.\n"
+    "Optionally add a [control] group with:\n"
+    "  port=8081   (HTTP control port; defaults to 8081 if omitted)\n\n"
     "Options:\n"
     "  --cli           Enable interactive stdin controls (1-9 enqueue, c=clear, s=start, x=stop, q=quit).\n"
-    "  --http-port=NN  Override HTTP control port (default tries 80, falls back to 8080).\n",
+    "  --http-port=NN  Override HTTP control port (default is config [control] port or 8081).\n",
     p);
 }
 
@@ -349,7 +351,8 @@ static gboolean load_config(const char *path,
                             SplashConfig *cfg,
                             SplashSeq **seqs_out,
                             int *n_seqs_out,
-                            GPtrArray **owned_strings_out) {
+                            GPtrArray **owned_strings_out,
+                            guint16 *http_port_out) {
   gboolean ok = FALSE;
   GError *error = NULL;
   GKeyFile *kf = g_key_file_new();
@@ -435,6 +438,22 @@ static gboolean load_config(const char *path,
     goto done;
   }
 
+  guint16 control_port = 8081;
+  if (g_key_file_has_key(kf, "control", "port", NULL)) {
+    error = NULL;
+    gint configured_port = g_key_file_get_integer(kf, "control", "port", &error);
+    if (error) {
+      fprintf(stderr, "Invalid control.port: %s\n", error->message);
+      g_error_free(error);
+      goto done;
+    }
+    if (configured_port < 1 || configured_port > 65535) {
+      fprintf(stderr, "control.port must be between 1 and 65535 (got %d)\n", configured_port);
+      goto done;
+    }
+    control_port = (guint16)configured_port;
+  }
+
   GArray *seq_array = g_array_new(FALSE, FALSE, sizeof(SplashSeq));
   if (!seq_array) goto done;
 
@@ -476,6 +495,7 @@ static gboolean load_config(const char *path,
   *seqs_out = seqs;
   *n_seqs_out = (int)seq_count;
   *owned_strings_out = owned_strings;
+  if (http_port_out) *http_port_out = control_port;
   ok = TRUE;
 
 done:
@@ -491,7 +511,7 @@ done:
 int main(int argc, char **argv){
   gboolean cli_mode = FALSE;
   gboolean port_overridden = FALSE;
-  guint16 http_port = 80;
+  guint16 http_port = 0;
   const char *config_path = NULL;
 
   for (int i = 1; i < argc; ++i) {
@@ -525,8 +545,13 @@ int main(int argc, char **argv){
   int n_seqs = 0;
   GPtrArray *owned_strings = NULL;
   SplashConfig cfg = {0};
-  if (!load_config(config_path, &cfg, &seqs, &n_seqs, &owned_strings)) {
+  guint16 config_http_port = 8081;
+  if (!load_config(config_path, &cfg, &seqs, &n_seqs, &owned_strings, &config_http_port)) {
     return 1;
+  }
+
+  if (!port_overridden) {
+    http_port = config_http_port;
   }
 
   Splash *S = splash_new();
@@ -570,31 +595,24 @@ int main(int argc, char **argv){
   g_signal_connect(http_service, "incoming", G_CALLBACK(on_http_client), &ctx);
   gboolean http_ok = FALSE;
   GError *http_error = NULL;
-  if (g_socket_listener_add_inet_port(G_SOCKET_LISTENER(http_service), http_port,
+  guint16 bind_port = http_port;
+  if (bind_port == 0) {
+    bind_port = config_http_port;
+  }
+
+  if (g_socket_listener_add_inet_port(G_SOCKET_LISTENER(http_service), bind_port,
                                       NULL, &http_error)) {
     http_ok = TRUE;
   } else {
-    fprintf(stderr, "Failed to bind HTTP port %u: %s\n", http_port,
+    fprintf(stderr, "Failed to bind HTTP port %u: %s\n", bind_port,
             http_error ? http_error->message : "unknown error");
     if (http_error) g_error_free(http_error);
-    http_error = NULL;
-    if (!port_overridden && http_port != 8080) {
-      http_port = 8080;
-      if (g_socket_listener_add_inet_port(G_SOCKET_LISTENER(http_service), http_port,
-                                          NULL, &http_error)) {
-        http_ok = TRUE;
-      } else {
-        fprintf(stderr, "Failed to bind fallback HTTP port %u: %s\n", http_port,
-                http_error ? http_error->message : "unknown error");
-        if (http_error) g_error_free(http_error);
-      }
-    }
   }
   if (http_ok) {
     g_socket_service_start(http_service);
     fprintf(stderr,
             "HTTP control listening on http://127.0.0.1:%u/request/{start,stop,enqueue/<name>,list}\n",
-            http_port);
+            bind_port);
   } else {
     fprintf(stderr, "HTTP control disabled (no available port).\n");
     g_object_unref(http_service);
