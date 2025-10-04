@@ -129,19 +129,56 @@ static void on_client_connected(GstRTSPServer *server, GstRTSPClient *client, gp
   g_signal_connect(client, "teardown-request", G_CALLBACK(on_req_teardown), user);
 }
 
-static void on_media_unprepared(GstRTSPMedia *media, Splash *s) {
-  GstElement *appsrc = (GstElement*)g_object_steal_qdata(G_OBJECT(media), media_appsrc_quark());
-  if (!appsrc) return;
+static gboolean bind_media_appsrc(Splash *s, GstRTSPMedia *media, const char *tag) {
+  GstElement *bin = gst_rtsp_media_get_element(media);
+  if (!bin) {
+    g_printerr("[rtsp] %s: missing bin\n", tag);
+    return FALSE;
+  }
+
+  GstElement *appsrc = gst_bin_get_by_name(GST_BIN(bin), "src");
+  gst_object_unref(bin);
+  if (!appsrc) {
+    g_printerr("[rtsp] %s: missing appsrc\n", tag);
+    return FALSE;
+  }
+
+  g_object_set(appsrc, "is-live", TRUE, "format", GST_FORMAT_TIME,
+               "block", TRUE, "do-timestamp", FALSE, NULL);
 
   g_mutex_lock(&s->lock);
-  if (s->appsrc_rtsp == appsrc) {
+  if (s->appsrc_rtsp)
     gst_object_unref(s->appsrc_rtsp);
-    s->appsrc_rtsp = NULL;
-  }
+  s->appsrc_rtsp = gst_object_ref(appsrc);
+  if (s->current_caps)
+    gst_app_src_set_caps(GST_APP_SRC(s->appsrc_rtsp), s->current_caps);
   g_mutex_unlock(&s->lock);
 
-  g_printerr("[rtsp] media-unprepared: appsrc removed\n");
+  g_object_set_qdata_full(G_OBJECT(media), media_appsrc_quark(),
+                          gst_object_ref(appsrc), (GDestroyNotify)gst_object_unref);
+
+  g_printerr("[rtsp] %s: appsrc ready\n", tag);
   gst_object_unref(appsrc);
+  return TRUE;
+}
+
+static void on_media_prepared(GstRTSPMedia *media, Splash *s) {
+  bind_media_appsrc(s, media, "media-prepared");
+}
+
+static void on_media_unprepared(GstRTSPMedia *media, Splash *s) {
+  GstElement *appsrc = (GstElement*)g_object_steal_qdata(G_OBJECT(media), media_appsrc_quark());
+  if (appsrc) {
+    g_mutex_lock(&s->lock);
+    if (s->appsrc_rtsp == appsrc) {
+      gst_object_unref(s->appsrc_rtsp);
+      s->appsrc_rtsp = NULL;
+    }
+    g_mutex_unlock(&s->lock);
+
+    g_printerr("[rtsp] media-unprepared: appsrc removed\n");
+    gst_object_unref(appsrc);
+  }
 }
 
 // ------------------------------------------------------------------
@@ -234,35 +271,9 @@ static void on_media_configure(GstRTSPMediaFactory *factory, GstRTSPMedia *media
   Splash *s = (Splash*)user;
   gst_rtsp_media_set_reusable(media, TRUE);
 
-  GstElement *bin = gst_rtsp_media_get_element(media);
-  if (!bin) {
-    g_printerr("[rtsp] media-configure: missing bin\n");
-    return;
-  }
-
-  GstElement *appsrc = gst_bin_get_by_name(GST_BIN(bin), "src");
-  gst_object_unref(bin);
-  if (!appsrc) {
-    g_printerr("[rtsp] media-configure: missing appsrc\n");
-    return;
-  }
-
-  g_object_set(appsrc, "is-live", TRUE, "format", GST_FORMAT_TIME,
-               "block", TRUE, "do-timestamp", FALSE, NULL);
-
-  g_mutex_lock(&s->lock);
-  if (s->appsrc_rtsp)
-    gst_object_unref(s->appsrc_rtsp);
-  s->appsrc_rtsp = gst_object_ref(appsrc);
-  if (s->current_caps)
-    gst_app_src_set_caps(GST_APP_SRC(s->appsrc_rtsp), s->current_caps);
-  g_mutex_unlock(&s->lock);
-
-  g_object_set_qdata_full(G_OBJECT(media), media_appsrc_quark(),
-                          gst_object_ref(appsrc), (GDestroyNotify)gst_object_unref);
+  bind_media_appsrc(s, media, "media-configure");
+  g_signal_connect(media, "prepared", G_CALLBACK(on_media_prepared), s);
   g_signal_connect(media, "unprepared", G_CALLBACK(on_media_unprepared), s);
-  g_printerr("[rtsp] media-configure: appsrc ready (shared)\n");
-  gst_object_unref(appsrc);
 }
 
 // ------------------------------------------------------------------
