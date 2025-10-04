@@ -47,6 +47,26 @@ illustrates every available section:
     add `loop_at_end=true` to mark the combo as eligible for looping when
     `combo_loop_mode` is `entire`.
 
+### UDP Monitor (optional)
+
+Add a `[monitor]` group to automatically stop the splashscreen when external
+traffic is received on the configured UDP port and resume it when traffic
+disappears:
+
+- `enabled`: Set to `true` (default when the group exists) to activate the
+  sniffer.
+- `port`: UDP port to inspect. Defaults to the `[stream]` `port` value.
+- `idle_timeout_ms`: The idle window (in milliseconds) before the splashscreen
+  restarts after external packets stop arriving.
+- `check_interval_ms`: Polling cadence for the idle timer. Lower values detect
+  drop-outs sooner at the expense of more wake-ups.
+- `interface`: Optional network interface name (for example `eth0`). When
+  provided, the sniffer only attaches to that interface, which helps avoid
+  treating the local fallback stream as "external" traffic.
+
+The monitor uses a raw packet socket and therefore currently requires Linux
+with sufficient privileges (root or the `CAP_NET_RAW` capability).
+
 ## Running
 
 Start the program by pointing it at your INI file:
