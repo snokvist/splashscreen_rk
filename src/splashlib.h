@@ -11,12 +11,6 @@ extern "C" {
 // Opaque handle
 typedef struct Splash Splash;
 
-// Output mode
-typedef enum {
-  SPLASH_OUT_UDP = 0,
-  SPLASH_OUT_RTSP = 1
-} SplashOutMode;
-
 // Named sequence: inclusive frame indices [start..end]
 typedef struct {
   const char *name;   // non-owning utf8 string
@@ -24,19 +18,17 @@ typedef struct {
   int end_frame;      // e.g., 180
 } SplashSeq;
 
-// UDP / RTSP endpoints
+// UDP endpoint
 typedef struct {
   const char *host;  // e.g., "127.0.0.1"
-  int port;          // e.g., 5600 or 8554
-  const char *path;  // RTSP only, e.g., "/splash"
+  int port;          // e.g., 5600
 } SplashEndpoint;
 
 // Configuration
 typedef struct {
   const char *input_path;   // Annex-B H.265 elementary stream (AUD+VUI recommended)
   double fps;               // e.g., 30.0
-  SplashOutMode out_mode;   // UDP or RTSP
-  SplashEndpoint endpoint;  // UDP: host+port; RTSP: host+port+path
+  SplashEndpoint endpoint;  // UDP host+port
 } SplashConfig;
 
 // Event callback (optional)

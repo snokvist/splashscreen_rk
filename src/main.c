@@ -4,6 +4,7 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <string.h>
+#include <stdlib.h>
 
 static gboolean set_stdin_nonblock(void) {
   struct termios t; if (tcgetattr(STDIN_FILENO, &t)) return FALSE;
@@ -32,27 +33,23 @@ static void on_evt(SplashEventType type, int a, int b, const char *msg, void *us
 static void usage(const char *p){
   fprintf(stderr,
     "Usage:\n"
-    "  %s <in.h265> <fps> --udp HOST PORT | --rtsp HOST PORT PATH\n\n"
+    "  %s <in.h265> <fps> --udp HOST PORT\n\n"
     "Interactive:\n"
     "  1/2/3  -> enqueue named sequences demo: intro, loop, outro\n"
     "  c      -> clear pending queue\n"
-    "  r      -> reconfigure (demo: toggles UDP<->RTSP)\n"
     "  q      -> quit\n", p);
 }
 
 int main(int argc, char **argv){
-  if (argc < 5) { usage(argv[0]); return 2; }
+  if (argc < 6) { usage(argv[0]); return 2; }
 
   const char *in = argv[1];
   double fps = g_ascii_strtod(argv[2], NULL);
-  SplashOutMode mode = SPLASH_OUT_UDP;
-  const char *host = NULL, *path = "/splash";
+  const char *host = NULL;
   int port = 0;
 
   if (strcmp(argv[3],"--udp")==0 && argc>=6){
-    mode = SPLASH_OUT_UDP; host = argv[4]; port = atoi(argv[5]);
-  } else if (strcmp(argv[3],"--rtsp")==0 && argc>=7){
-    mode = SPLASH_OUT_RTSP; host = argv[4]; port = atoi(argv[5]); path = argv[6];
+    host = argv[4]; port = atoi(argv[5]);
   } else {
     usage(argv[0]); return 2;
   }
@@ -72,8 +69,7 @@ int main(int argc, char **argv){
   SplashConfig cfg = {
     .input_path = in,
     .fps = fps,
-    .out_mode = mode,
-    .endpoint = { .host = host, .port = port, .path = path }
+    .endpoint = { .host = host, .port = port }
   };
   if (!splash_apply_config(S, &cfg)) {
     fprintf(stderr, "Failed to apply config\n");
@@ -84,11 +80,10 @@ int main(int argc, char **argv){
     return 1;
   }
 
-  fprintf(stderr, "Running. Press 1/2/3 to enqueue intro/loop/outro; r=reconfigure; c=clear; q=quit\n");
+  fprintf(stderr, "Running. Press 1/2/3 to enqueue intro/loop/outro; c=clear; q=quit\n");
   set_stdin_nonblock();
 
   // Key loop
-  int rtsp_toggle = (mode==SPLASH_OUT_RTSP);
   for (;;) {
     char ch;
     if (read(STDIN_FILENO, &ch, 1)==1){
@@ -97,20 +92,6 @@ int main(int argc, char **argv){
       else if (ch=='1') { splash_enqueue_next_by_name(S, "intro"); }
       else if (ch=='2') { splash_enqueue_next_by_name(S, "loop"); }
       else if (ch=='3') { splash_enqueue_next_by_name(S, "outro"); }
-      else if (ch=='r') {
-        // Demo hot-reconfigure: toggle UDP <-> RTSP with same host/ports
-        rtsp_toggle = !rtsp_toggle;
-        SplashConfig nc = cfg;
-        if (rtsp_toggle) {
-          nc.out_mode = SPLASH_OUT_RTSP; nc.endpoint.path = "/splash";
-          fprintf(stderr, "[demo] reconfig -> RTSP rtsp://%s:%d%s\n", nc.endpoint.host, nc.endpoint.port, nc.endpoint.path);
-        } else {
-          nc.out_mode = SPLASH_OUT_UDP;
-          fprintf(stderr, "[demo] reconfig -> UDP %s:%d\n", nc.endpoint.host, nc.endpoint.port);
-        }
-        splash_apply_config(S, &nc);
-        splash_start(S); // resumes reader + seek
-      }
     } else {
       // let GLib do the heavy lifting
       while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
