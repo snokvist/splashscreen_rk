@@ -1,7 +1,7 @@
 # Makefile (outputs in current dir; sources in ./src)
 
 # --- Config ---
-PKGS := gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtsp-server-1.0
+PKGS := gstreamer-1.0 gstreamer-app-1.0
 CC   ?= gcc
 
 CFLAGS  ?= -O2 -fPIC $(shell pkg-config --cflags $(PKGS)) -Isrc
@@ -15,7 +15,7 @@ OBJDIR   := build
 LIB_OBJS := $(OBJDIR)/splashlib.o
 
 # --- Phony targets ---
-.PHONY: all clean static run-udp run-rtsp
+.PHONY: all clean static run-udp
 
 # Default: shared lib + app linked against it
 all: $(LIB) $(APP)
@@ -42,9 +42,6 @@ $(OBJDIR):
 # Convenience run targets (adjust args as needed)
 run-udp: $(APP)
 	./$(APP) spinner_1080p30.h265 30 --udp 127.0.0.1 5600
-
-run-rtsp: $(APP)
-	./$(APP) spinner_1080p30.h265 30 --rtsp 0.0.0.0 8554 /splash
 
 # Cleanup
 clean:
