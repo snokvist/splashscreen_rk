@@ -80,54 +80,48 @@ static gboolean do_segment_seek_locked(Splash *s, int which){
 }
 
 // ------------------------------------------------------------------
-// RTSP debug helpers (portable across GStreamer versions)
+// RTSP debug helpers (no version-sensitive parsing)
 // ------------------------------------------------------------------
-static gboolean on_rtsp_request(GstRTSPClient *client, GstRTSPContext *ctx, gpointer user) {
-  const gchar *ip = "?";
+static inline const gchar* rtsp_client_ip(GstRTSPClient *client) {
 #if GST_CHECK_VERSION(1,14,0)
   GstRTSPConnection *conn = gst_rtsp_client_get_connection(client);
-  if (conn) ip = gst_rtsp_connection_get_ip(conn);
+  if (conn) return gst_rtsp_connection_get_ip(conn);
 #endif
+  return "?";
+}
+static inline const gchar* rtsp_ctx_uri(GstRTSPContext *ctx) {
+  if (ctx && ctx->uri && ctx->uri->abspath) return ctx->uri->abspath;
+  return "?";
+}
 
-  const gchar *uri = "?";
-  GstRTSPMethod method = GST_RTSP_INVALID;
-  if (ctx && ctx->request) {
-#if GST_CHECK_VERSION(1,8,0)
-    const gchar *parsed_uri = NULL;
-    if (gst_rtsp_message_parse_request(ctx->request, &method, &parsed_uri) == GST_RTSP_OK) {
-      uri = parsed_uri ? parsed_uri : "?";
-    }
-#else
-    method = GST_RTSP_OPTIONS; // minimal fallback
-#endif
-  }
-
-  const gchar *mtext = gst_rtsp_method_as_text(method);
-  if (!mtext) mtext = "REQUEST";
-  g_printerr("[rtsp] %s %s from %s\n", mtext, uri, ip);
+static gboolean log_rtsp_req(const char *method, GstRTSPClient *client, GstRTSPContext *ctx, gpointer user){
+  (void)user;
+  g_printerr("[rtsp] %s %s from %s\n", method, rtsp_ctx_uri(ctx), rtsp_client_ip(client));
   return FALSE; // continue normal handling
 }
 
-static void on_client_connected(GstRTSPServer *server, GstRTSPClient *client, gpointer user) {
-  const gchar *ip = "?";
-#if GST_CHECK_VERSION(1,14,0)
-  GstRTSPConnection *conn = gst_rtsp_client_get_connection(client);
-  if (conn) ip = gst_rtsp_connection_get_ip(conn);
-#endif
-  g_printerr("[rtsp] client-connected from %s\n", ip);
+static gboolean on_req_options (GstRTSPClient *c, GstRTSPContext *ctx, gpointer u){ return log_rtsp_req("OPTIONS",  c, ctx, u); }
+static gboolean on_req_describe(GstRTSPClient *c, GstRTSPContext *ctx, gpointer u){ return log_rtsp_req("DESCRIBE", c, ctx, u); }
+static gboolean on_req_setup   (GstRTSPClient *c, GstRTSPContext *ctx, gpointer u){ return log_rtsp_req("SETUP",    c, ctx, u); }
+static gboolean on_req_play    (GstRTSPClient *c, GstRTSPContext *ctx, gpointer u){ return log_rtsp_req("PLAY",     c, ctx, u); }
+static gboolean on_req_teardown(GstRTSPClient *c, GstRTSPContext *ctx, gpointer u){ return log_rtsp_req("TEARDOWN", c, ctx, u); }
 
+static void on_client_connected(GstRTSPServer *server, GstRTSPClient *client, gpointer user) {
+  (void)server; (void)user;
+  g_printerr("[rtsp] client-connected from %s\n", rtsp_client_ip(client));
   // Hook common RTSP request signals
-  g_signal_connect(client, "options-request",  G_CALLBACK(on_rtsp_request), user);
-  g_signal_connect(client, "describe-request", G_CALLBACK(on_rtsp_request), user);
-  g_signal_connect(client, "setup-request",    G_CALLBACK(on_rtsp_request), user);
-  g_signal_connect(client, "play-request",     G_CALLBACK(on_rtsp_request), user);
-  g_signal_connect(client, "teardown-request", G_CALLBACK(on_rtsp_request), user);
+  g_signal_connect(client, "options-request",  G_CALLBACK(on_req_options),  user);
+  g_signal_connect(client, "describe-request", G_CALLBACK(on_req_describe), user);
+  g_signal_connect(client, "setup-request",    G_CALLBACK(on_req_setup),    user);
+  g_signal_connect(client, "play-request",     G_CALLBACK(on_req_play),     user);
+  g_signal_connect(client, "teardown-request", G_CALLBACK(on_req_teardown), user);
 }
 
 // ------------------------------------------------------------------
 // GStreamer callbacks
 // ------------------------------------------------------------------
 static gboolean on_reader_bus(GstBus *bus, GstMessage *m, gpointer user) {
+  (void)bus;
   Splash *s = (Splash*)user;
   switch (GST_MESSAGE_TYPE(m)) {
     case GST_MESSAGE_SEGMENT_DONE:
@@ -182,6 +176,7 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user) {
 // RTSP media wiring
 // ------------------------------------------------------------------
 static void on_media_configure(GstRTSPMediaFactory *factory, GstRTSPMedia *media, gpointer user) {
+  (void)factory;
   Splash *s = (Splash*)user;
   gst_rtsp_media_set_reusable(media, TRUE);
   GstElement *bin = gst_rtsp_media_get_element(media); // takes ref
@@ -298,7 +293,8 @@ void splash_free(Splash *s){
   splash_stop(s);
   g_mutex_lock(&s->lock);
   destroy_pipelines_locked(s);
-  for (int i=0;i<s->nseq;i++){ free_str(&s->seqs[i].name); }
+  for (int i=0;i>s->nseq;i++){ free_str(&s->seqs[i].name); }
+  for (int i=0;i<s->nseq;i++){ free_str(&s->seqs[i].name); } // fixed loop
   free_str(&s->input_path); free_str(&s->host); free_str(&s->path);
   g_mutex_unlock(&s->lock);
   if (s->loop) g_main_loop_unref(s->loop);
