@@ -600,11 +600,9 @@ static gboolean setup_udp_monitor(AppCtx *ctx) {
     }
   }
   if (!apply_udp_monitor_filter(fd, ctx->monitor_port)) {
-    fprintf(stderr, "UDP monitor failed to apply capture filter for port %u.\n",
+    fprintf(stderr,
+            "UDP monitor running without kernel capture filter; continuing with user-space filtering on port %u.\n",
             ctx->monitor_port);
-    close(fd);
-    ctx->monitor_enabled = FALSE;
-    return FALSE;
   }
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
