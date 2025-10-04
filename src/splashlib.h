@@ -60,10 +60,11 @@ void splash_quit(Splash *s);   // quits the loop (non-blocking)
 void splash_stop(Splash *s);   // stops pipelines
 
 // ---- Control / Queue API ----
-// Two-queue model: current loops forever; "next" takes over at segment boundary.
-// Returns false if idx/name not found.
+// Multi-queue model: current loops forever; queued entries take over at segment boundaries.
+// Returns false if any index/name is invalid or the queue would overflow.
 bool splash_enqueue_next_by_index(Splash *s, int idx);
 bool splash_enqueue_next_by_name(Splash *s, const char *name);
+bool splash_enqueue_next_many(Splash *s, const int *indices, int n_indices);
 void splash_clear_next(Splash *s);
 
 // Query helpers (optional)

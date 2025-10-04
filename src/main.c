@@ -10,9 +10,25 @@
 #include <unistd.h>
 
 typedef struct {
+  const char *name;
+  int *indices;
+  int count;
+} ComboSeq;
+
+static void free_combos(ComboSeq *combos, int count) {
+  if (!combos) return;
+  for (int i = 0; i < count; ++i) {
+    g_free(combos[i].indices);
+  }
+  g_free(combos);
+}
+
+typedef struct {
   Splash *splash;
   SplashSeq *sequences;
   int sequence_count;
+  ComboSeq *combos;
+  int combo_count;
   gboolean started;
   GMainLoop *loop;
 } AppCtx;
@@ -46,6 +62,16 @@ static gchar *json_escape(const char *in) {
     }
   }
   return g_string_free(out, FALSE);
+}
+
+static ComboSeq *find_combo_by_name(AppCtx *ctx, const char *name) {
+  if (!ctx || !name) return NULL;
+  for (int i = 0; i < ctx->combo_count; ++i) {
+    if (g_strcmp0(ctx->combos[i].name, name) == 0) {
+      return &ctx->combos[i];
+    }
+  }
+  return NULL;
 }
 
 static gboolean send_http_response(GOutputStream *out,
@@ -117,6 +143,29 @@ static gboolean handle_http_path(AppCtx *ctx,
       g_string_append(body, "\"");
       g_free(escaped);
     }
+    g_string_append(body, "],\"combos\":[");
+    for (int i = 0; i < ctx->combo_count; ++i) {
+      if (i > 0) g_string_append(body, ",");
+      gchar *escaped = json_escape(ctx->combos[i].name);
+      g_string_append(body, "{\"name\":\"");
+      g_string_append(body, escaped);
+      g_string_append(body, "\",\"order\":[");
+      g_free(escaped);
+      for (int j = 0; j < ctx->combos[i].count; ++j) {
+        if (j > 0) g_string_append(body, ",");
+        const char *part_name = NULL;
+        int idx = ctx->combos[i].indices[j];
+        if (idx >= 0 && idx < ctx->sequence_count) {
+          part_name = ctx->sequences[idx].name;
+        }
+        gchar *part_escaped = json_escape(part_name ? part_name : "");
+        g_string_append(body, "\"");
+        g_string_append(body, part_escaped);
+        g_string_append(body, "\"");
+        g_free(part_escaped);
+      }
+      g_string_append(body, "]}");
+    }
     g_string_append(body, "]}");
     gboolean ok = send_http_response(out, 200, "OK",
                                      "application/json",
@@ -131,26 +180,52 @@ static gboolean handle_http_path(AppCtx *ctx,
     gchar *decoded = g_uri_unescape_string(raw_name, NULL);
     gboolean ok = FALSE;
     if (decoded && decoded[0] != '\0') {
-      if (splash_enqueue_next_by_name(ctx->splash, decoded)) {
-        gchar *escaped = json_escape(decoded);
-        GString *body = g_string_new("{\"status\":\"queued\",\"name\":\"");
-        g_string_append(body, escaped);
-        g_string_append(body, "\"}");
-        ok = send_http_response(out, 200, "OK",
-                                "application/json",
-                                body->str);
-        g_string_free(body, TRUE);
-        g_free(escaped);
+      int idx = splash_find_index_by_name(ctx->splash, decoded);
+      if (idx >= 0) {
+        if (splash_enqueue_next_by_index(ctx->splash, idx)) {
+          gchar *escaped = json_escape(decoded);
+          GString *body = g_string_new("{\"status\":\"queued\",\"name\":\"");
+          g_string_append(body, escaped);
+          g_string_append(body, "\"}");
+          ok = send_http_response(out, 200, "OK",
+                                  "application/json",
+                                  body->str);
+          g_string_free(body, TRUE);
+          g_free(escaped);
+        } else {
+          ok = send_http_response(out, 409, "Conflict",
+                                  "application/json",
+                                  "{\"status\":\"queue_full\"}");
+        }
       } else {
-        gchar *escaped = json_escape(decoded);
-        GString *body = g_string_new("{\"status\":\"not_found\",\"name\":\"");
-        g_string_append(body, escaped);
-        g_string_append(body, "\"}");
-        ok = send_http_response(out, 404, "Not Found",
-                                "application/json",
-                                body->str);
-        g_string_free(body, TRUE);
-        g_free(escaped);
+        ComboSeq *combo = find_combo_by_name(ctx, decoded);
+        if (combo && combo->count > 0) {
+          if (splash_enqueue_next_many(ctx->splash, combo->indices, combo->count)) {
+            gchar *escaped = json_escape(decoded);
+            GString *body = g_string_new("{\"status\":\"queued_combo\",\"name\":\"");
+            g_string_append(body, escaped);
+            g_string_append_printf(body, "\",\"length\":%d}", combo->count);
+            ok = send_http_response(out, 200, "OK",
+                                    "application/json",
+                                    body->str);
+            g_string_free(body, TRUE);
+            g_free(escaped);
+          } else {
+            ok = send_http_response(out, 409, "Conflict",
+                                    "application/json",
+                                    "{\"status\":\"queue_full\"}");
+          }
+        } else {
+          gchar *escaped = json_escape(decoded);
+          GString *body = g_string_new("{\"status\":\"not_found\",\"name\":\"");
+          g_string_append(body, escaped);
+          g_string_append(body, "\"}");
+          ok = send_http_response(out, 404, "Not Found",
+                                  "application/json",
+                                  body->str);
+          g_string_free(body, TRUE);
+          g_free(escaped);
+        }
       }
     } else {
       ok = send_http_response(out, 400, "Bad Request",
@@ -284,7 +359,11 @@ static void usage(const char *p){
     "  fps=30.0\n"
     "  host=127.0.0.1\n"
     "  port=5600\n"
-    "and one or more [sequence NAME] groups defining start/end frames.\n"
+    "and one or more [sequence NAME] groups. Define raw clips with:\n"
+    "  start=BEGIN_FRAME\n"
+    "  end=END_FRAME\n"
+    "or build combo playlists with:\n"
+    "  order=seqA,seqB,...   (references previously defined sequences)\n"
     "Optionally add a [control] group with:\n"
     "  port=8081   (HTTP control port; defaults to 8081 if omitted)\n\n"
     "Options:\n"
@@ -293,10 +372,24 @@ static void usage(const char *p){
     p);
 }
 
-static gboolean parse_sequence_group(GKeyFile *kf, const gchar *group,
-                                     GPtrArray *owned_strings,
-                                     GArray *out_sequences,
-                                     GError **error) {
+typedef struct {
+  gchar *name;
+  GPtrArray *parts; // array of gchar* (owned)
+} PendingCombo;
+
+static void pending_combo_free(PendingCombo *pc) {
+  if (!pc) return;
+  if (pc->parts) {
+    for (guint i = 0; i < pc->parts->len; ++i) {
+      g_free(g_ptr_array_index(pc->parts, i));
+    }
+    g_ptr_array_free(pc->parts, TRUE);
+  }
+  g_free(pc->name);
+  g_free(pc);
+}
+
+static gchar *extract_sequence_name(const gchar *group, GError **error) {
   const gsize prefix_len = strlen(SEQ_GROUP_PREFIX);
   const gchar *raw = group + prefix_len;
   while (g_ascii_isspace(*raw)) raw++;
@@ -304,7 +397,7 @@ static gboolean parse_sequence_group(GKeyFile *kf, const gchar *group,
   if (*raw == '\0') {
     g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
                 "Sequence group '%s' is missing a name", group);
-    return FALSE;
+    return NULL;
   }
 
   gchar *name = g_strdup(raw);
@@ -318,10 +411,22 @@ static gboolean parse_sequence_group(GKeyFile *kf, const gchar *group,
     g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
                 "Sequence group '%s' resolved to an empty name", group);
     g_free(name);
+    return NULL;
+  }
+  return name;
+}
+
+static gboolean parse_sequence_group(GKeyFile *kf, const gchar *group,
+                                     GPtrArray *owned_strings,
+                                     GArray *out_sequences,
+                                     GError **error) {
+  GError *local_error = NULL;
+  gchar *name = extract_sequence_name(group, &local_error);
+  if (!name) {
+    if (local_error) g_propagate_error(error, local_error);
     return FALSE;
   }
 
-  GError *local_error = NULL;
   gint start = g_key_file_get_integer(kf, group, "start", &local_error);
   if (local_error) {
     g_propagate_error(error, local_error);
@@ -347,16 +452,96 @@ static gboolean parse_sequence_group(GKeyFile *kf, const gchar *group,
   return TRUE;
 }
 
+static gboolean parse_combo_group(GKeyFile *kf, const gchar *group,
+                                  PendingCombo **out_combo,
+                                  GError **error) {
+  GError *local_error = NULL;
+  gchar *name = extract_sequence_name(group, &local_error);
+  if (!name) {
+    if (local_error) g_propagate_error(error, local_error);
+    return FALSE;
+  }
+
+  gchar *order = g_key_file_get_string(kf, group, "order", &local_error);
+  if (local_error) {
+    g_propagate_error(error, local_error);
+    g_free(name);
+    return FALSE;
+  }
+  if (!order) {
+    g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
+                "Combo sequence '%s' missing order", name);
+    g_free(name);
+    return FALSE;
+  }
+
+  gchar **parts = g_strsplit(order, ",", -1);
+  g_free(order);
+  if (!parts) {
+    g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
+                "Combo sequence '%s' has invalid order", name);
+    g_free(name);
+    return FALSE;
+  }
+
+  GPtrArray *part_array = g_ptr_array_new();
+  for (gchar **p = parts; *p; ++p) {
+    gchar *trimmed = g_strdup(*p);
+    g_strstrip(trimmed);
+    if (trimmed[0] == '\0') {
+      g_free(trimmed);
+      g_strfreev(parts);
+      if (part_array) {
+        for (guint i = 0; i < part_array->len; ++i) {
+          g_free(g_ptr_array_index(part_array, i));
+        }
+        g_ptr_array_free(part_array, TRUE);
+      }
+      g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
+                  "Combo sequence '%s' contains an empty entry", name);
+      g_free(name);
+      return FALSE;
+    }
+    g_ptr_array_add(part_array, trimmed);
+  }
+  g_strfreev(parts);
+
+  if (part_array->len == 0) {
+    for (guint i = 0; i < part_array->len; ++i) {
+      g_free(g_ptr_array_index(part_array, i));
+    }
+    g_ptr_array_free(part_array, TRUE);
+    g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
+                "Combo sequence '%s' has an empty order", name);
+    g_free(name);
+    return FALSE;
+  }
+
+  PendingCombo *combo = g_new0(PendingCombo, 1);
+  combo->name = name;
+  combo->parts = part_array;
+  *out_combo = combo;
+  return TRUE;
+}
+
 static gboolean load_config(const char *path,
                             SplashConfig *cfg,
                             SplashSeq **seqs_out,
                             int *n_seqs_out,
+                            ComboSeq **combos_out,
+                            int *n_combos_out,
                             GPtrArray **owned_strings_out,
                             guint16 *http_port_out) {
   gboolean ok = FALSE;
   GError *error = NULL;
+  ComboSeq *combo_array = NULL;
+  guint combo_count = 0;
+  GPtrArray *combo_defs = NULL;
   GKeyFile *kf = g_key_file_new();
   if (!kf) return FALSE;
+
+  if (combos_out) *combos_out = NULL;
+  if (n_combos_out) *n_combos_out = 0;
 
   gchar *config_abs = g_canonicalize_filename(path, NULL);
   if (!config_abs) {
@@ -456,19 +641,53 @@ static gboolean load_config(const char *path,
 
   GArray *seq_array = g_array_new(FALSE, FALSE, sizeof(SplashSeq));
   if (!seq_array) goto done;
+  combo_defs = g_ptr_array_new_with_free_func((GDestroyNotify)pending_combo_free);
+  if (!combo_defs) {
+    g_array_free(seq_array, TRUE);
+    goto done;
+  }
 
   gsize n_groups = 0;
   gchar **groups = g_key_file_get_groups(kf, &n_groups);
   for (gsize i = 0; i < n_groups; ++i) {
     if (g_str_has_prefix(groups[i], SEQ_GROUP_PREFIX)) {
-      if (!parse_sequence_group(kf, groups[i], owned_strings, seq_array, &error)) {
-        fprintf(stderr, "Invalid sequence config: %s\n",
-                error ? error->message : "unknown error");
-        if (error) g_error_free(error);
-        error = NULL;
-        g_strfreev(groups);
-        g_array_free(seq_array, TRUE);
-        goto done;
+      gboolean has_order = g_key_file_has_key(kf, groups[i], "order", NULL);
+      gboolean has_start = g_key_file_has_key(kf, groups[i], "start", NULL);
+      gboolean has_end = g_key_file_has_key(kf, groups[i], "end", NULL);
+      if (has_order) {
+        if (has_start || has_end) {
+          fprintf(stderr,
+                  "Sequence group '%s' cannot mix order with start/end\n",
+                  groups[i]);
+          g_strfreev(groups);
+          g_array_free(seq_array, TRUE);
+          goto done;
+        }
+        PendingCombo *combo = NULL;
+        if (!parse_combo_group(kf, groups[i], &combo, &error)) {
+          fprintf(stderr, "Invalid combo sequence config: %s\n",
+                  error ? error->message : "unknown error");
+          if (error) g_error_free(error);
+          error = NULL;
+          g_strfreev(groups);
+          g_array_free(seq_array, TRUE);
+          g_ptr_array_free(combo_defs, TRUE);
+          combo_defs = NULL;
+          goto done;
+        }
+        g_ptr_array_add(combo_defs, combo);
+      } else {
+        if (!parse_sequence_group(kf, groups[i], owned_strings, seq_array, &error)) {
+          fprintf(stderr, "Invalid sequence config: %s\n",
+                  error ? error->message : "unknown error");
+          if (error) g_error_free(error);
+          error = NULL;
+          g_strfreev(groups);
+          g_array_free(seq_array, TRUE);
+          g_ptr_array_free(combo_defs, TRUE);
+          combo_defs = NULL;
+          goto done;
+        }
       }
     }
   }
@@ -477,6 +696,8 @@ static gboolean load_config(const char *path,
   if (seq_array->len == 0) {
     fprintf(stderr, "Config must define at least one [sequence NAME] group\n");
     g_array_free(seq_array, TRUE);
+    g_ptr_array_free(combo_defs, TRUE);
+    combo_defs = NULL;
     goto done;
   }
 
@@ -492,13 +713,84 @@ static gboolean load_config(const char *path,
   }
   g_array_free(seq_array, TRUE);
 
+  combo_count = combo_defs->len;
+  if (combo_count > 0) {
+    combo_array = g_new0(ComboSeq, combo_count);
+    if (!combo_array) {
+      g_ptr_array_free(combo_defs, TRUE);
+      combo_defs = NULL;
+      g_free(seqs);
+      goto done;
+    }
+    for (guint i = 0; i < combo_count; ++i) {
+      PendingCombo *pc = g_ptr_array_index(combo_defs, i);
+      combo_array[i].count = (int)pc->parts->len;
+      combo_array[i].indices = g_new0(int, combo_array[i].count);
+      if (!combo_array[i].indices) {
+        g_ptr_array_free(combo_defs, TRUE);
+        combo_defs = NULL;
+        for (guint k = 0; k <= i; ++k) {
+          if (combo_array[k].indices) g_free(combo_array[k].indices);
+        }
+        g_free(combo_array);
+        g_free(seqs);
+        goto done;
+      }
+      combo_array[i].name = pc->name;
+      g_ptr_array_add(owned_strings, pc->name);
+      pc->name = NULL;
+      for (guint j = 0; j < pc->parts->len; ++j) {
+        const char *part_name = g_ptr_array_index(pc->parts, j);
+        int found = -1;
+        for (guint sidx = 0; sidx < seq_count; ++sidx) {
+          if (g_strcmp0(seqs[sidx].name, part_name) == 0) {
+            found = (int)sidx;
+            break;
+          }
+        }
+        if (found < 0) {
+          fprintf(stderr,
+                  "Combo sequence '%s' references unknown sequence '%s'\n",
+                  combo_array[i].name ? combo_array[i].name : "?",
+                  part_name);
+          g_ptr_array_free(combo_defs, TRUE);
+          combo_defs = NULL;
+          for (guint k = 0; k <= i; ++k) {
+            g_free(combo_array[k].indices);
+          }
+          g_free(combo_array);
+          g_free(seqs);
+          goto done;
+        }
+        combo_array[i].indices[j] = found;
+      }
+    }
+  }
+  if (combo_defs) {
+    g_ptr_array_free(combo_defs, TRUE);
+    combo_defs = NULL;
+  }
+
   *seqs_out = seqs;
   *n_seqs_out = (int)seq_count;
+  if (combos_out) *combos_out = combo_array;
+  if (n_combos_out) *n_combos_out = (int)combo_count;
   *owned_strings_out = owned_strings;
   if (http_port_out) *http_port_out = control_port;
   ok = TRUE;
 
 done:
+  if (!ok) {
+    if (combo_array) {
+      for (guint i = 0; i < combo_count; ++i) {
+        g_free(combo_array[i].indices);
+      }
+      g_free(combo_array);
+    }
+  }
+  if (combo_defs) {
+    g_ptr_array_free(combo_defs, TRUE);
+  }
   if (!ok) {
     g_ptr_array_free(owned_strings, TRUE);
   }
@@ -543,10 +835,14 @@ int main(int argc, char **argv){
 
   SplashSeq *seqs = NULL;
   int n_seqs = 0;
+  ComboSeq *combos = NULL;
+  int n_combos = 0;
   GPtrArray *owned_strings = NULL;
   SplashConfig cfg = {0};
   guint16 config_http_port = 8081;
-  if (!load_config(config_path, &cfg, &seqs, &n_seqs, &owned_strings, &config_http_port)) {
+  if (!load_config(config_path, &cfg, &seqs, &n_seqs,
+                   &combos, &n_combos,
+                   &owned_strings, &config_http_port)) {
     return 1;
   }
 
@@ -559,6 +855,8 @@ int main(int argc, char **argv){
   ctx.splash = S;
   ctx.sequences = seqs;
   ctx.sequence_count = n_seqs;
+  ctx.combos = combos;
+  ctx.combo_count = n_combos;
   ctx.started = FALSE;
   ctx.loop = g_main_loop_new(NULL, FALSE);
 
@@ -569,6 +867,7 @@ int main(int argc, char **argv){
     if (ctx.loop) g_main_loop_unref(ctx.loop);
     splash_free(S);
     g_free(seqs);
+    free_combos(combos, n_combos);
     g_ptr_array_free(owned_strings, TRUE);
     return 1;
   }
@@ -578,6 +877,7 @@ int main(int argc, char **argv){
     if (ctx.loop) g_main_loop_unref(ctx.loop);
     splash_free(S);
     g_free(seqs);
+    free_combos(combos, n_combos);
     g_ptr_array_free(owned_strings, TRUE);
     return 1;
   }
@@ -586,6 +886,7 @@ int main(int argc, char **argv){
     if (ctx.loop) g_main_loop_unref(ctx.loop);
     splash_free(S);
     g_free(seqs);
+    free_combos(combos, n_combos);
     g_ptr_array_free(owned_strings, TRUE);
     return 1;
   }
@@ -627,6 +928,19 @@ int main(int argc, char **argv){
   if (n_seqs > 9) {
     fprintf(stderr, "Additional sequences are available via API calls only.\n");
   }
+  if (n_combos > 0) {
+    fprintf(stderr, "Combo sequences (%d):\n", n_combos);
+    for (int i = 0; i < n_combos; ++i) {
+      fprintf(stderr, "  - %s -> ", combos[i].name);
+      for (int j = 0; j < combos[i].count; ++j) {
+        int idx = combos[i].indices[j];
+        const char *part = (idx >= 0 && idx < n_seqs) ? seqs[idx].name : "?";
+        fprintf(stderr, "%s%s", j == 0 ? "" : ",", part);
+      }
+      fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "Combo sequences can be enqueued via the HTTP API.\n");
+  }
   if (cli_mode) {
     fprintf(stderr,
             "Interactive CLI enabled. Press 1-%d to enqueue; c=clear; s=start; x=stop; q=quit\n",
@@ -661,6 +975,7 @@ int main(int argc, char **argv){
   if (ctx.loop) g_main_loop_unref(ctx.loop);
   splash_free(S);
   g_free(seqs);
+  free_combos(combos, n_combos);
   g_ptr_array_free(owned_strings, TRUE);
   return 0;
 }

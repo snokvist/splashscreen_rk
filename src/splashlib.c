@@ -5,6 +5,7 @@
 #include <stdlib.h>
 
 #define MAX_SEQS 32
+#define MAX_QUEUE 256
 
 typedef struct {
   char *name; // owned copy
@@ -41,9 +42,10 @@ struct Splash {
   // Timing
   GstClockTime next_pts;
 
-  // Two-queue state
-  int active_idx;   // current looping sequence index
-  int pending_idx;  // -1 none
+  // Queue state
+  int active_idx;                 // current looping sequence index
+  int pending_queue[MAX_QUEUE];   // FIFO of queued sequence indices
+  int pending_count;              // number of valid entries in queue
 
   // Events
   SplashEventCb evt_cb;
@@ -77,10 +79,15 @@ static gboolean on_reader_bus(GstBus *bus, GstMessage *m, gpointer user) {
     case GST_MESSAGE_SEGMENT_DONE:
     case GST_MESSAGE_EOS: {
       g_mutex_lock(&s->lock);
-      if (s->pending_idx >= 0) {
+      if (s->pending_count > 0) {
         int from = s->active_idx;
-        s->active_idx = s->pending_idx;
-        s->pending_idx = -1;
+        int next = s->pending_queue[0];
+        if (s->pending_count > 1) {
+          memmove(&s->pending_queue[0], &s->pending_queue[1],
+                  (s->pending_count - 1) * sizeof(int));
+        }
+        s->pending_count--;
+        s->active_idx = next;
         emit_evt(s, SPLASH_EVT_SWITCHED_AT_BOUNDARY, from, s->active_idx, NULL);
       }
       do_segment_seek_locked(s, s->active_idx);
@@ -192,7 +199,7 @@ Splash* splash_new(void){
   s->host = g_strdup("127.0.0.1");
   s->port = 5600;
   s->active_idx = -1;
-  s->pending_idx = -1;
+  s->pending_count = 0;
   return s;
 }
 
@@ -237,8 +244,16 @@ bool splash_set_sequences(Splash *s, const SplashSeq *seqs, int n_seqs){
 
   // If nothing active yet, pick 0
   if (s->active_idx < 0 && s->nseq > 0) s->active_idx = 0;
-  // clamp pending if needed
-  if (s->pending_idx >= s->nseq) s->pending_idx = -1;
+  // prune pending queue of invalid indices
+  int w = 0;
+  for (int r = 0; r < s->pending_count; ++r) {
+    int idx = s->pending_queue[r];
+    if (idx >= 0 && idx < s->nseq) {
+      if (w != r) s->pending_queue[w] = idx;
+      ++w;
+    }
+  }
+  s->pending_count = w;
 
   g_mutex_unlock(&s->lock);
   return true;
@@ -313,16 +328,7 @@ void splash_stop(Splash *s){
 
 // ---- Queue control ----
 bool splash_enqueue_next_by_index(Splash *s, int idx){
-  g_mutex_lock(&s->lock);
-  if (idx < 0 || idx >= s->nseq || idx == s->active_idx) {
-    g_mutex_unlock(&s->lock);
-    return false;
-  }
-  s->pending_idx = idx;
-  int to = s->pending_idx;
-  g_mutex_unlock(&s->lock);
-  emit_evt(s, SPLASH_EVT_QUEUED_NEXT, to, 0, NULL);
-  return true;
+  return splash_enqueue_next_many(s, &idx, 1);
 }
 
 bool splash_enqueue_next_by_name(Splash *s, const char *name){
@@ -338,7 +344,7 @@ bool splash_enqueue_next_by_name(Splash *s, const char *name){
 
 void splash_clear_next(Splash *s){
   g_mutex_lock(&s->lock);
-  s->pending_idx = -1;
+  s->pending_count = 0;
   g_mutex_unlock(&s->lock);
   emit_evt(s, SPLASH_EVT_CLEARED_QUEUE, 0, 0, NULL);
 }
@@ -352,9 +358,35 @@ int splash_active_index(Splash *s){
 
 int splash_pending_index(Splash *s){
   g_mutex_lock(&s->lock);
-  int v = s->pending_idx;
+  int v = (s->pending_count > 0) ? s->pending_queue[0] : -1;
   g_mutex_unlock(&s->lock);
   return v;
+}
+
+bool splash_enqueue_next_many(Splash *s, const int *indices, int n_indices){
+  if (!s || !indices || n_indices <= 0) return false;
+  g_mutex_lock(&s->lock);
+  if (s->nseq <= 0 || s->pending_count + n_indices > MAX_QUEUE) {
+    g_mutex_unlock(&s->lock);
+    return false;
+  }
+  for (int i = 0; i < n_indices; ++i) {
+    if (indices[i] < 0 || indices[i] >= s->nseq) {
+      g_mutex_unlock(&s->lock);
+      return false;
+    }
+  }
+  for (int i = 0; i < n_indices; ++i) {
+    s->pending_queue[s->pending_count++] = indices[i];
+  }
+  int to_emit[MAX_QUEUE];
+  int emit_count = n_indices;
+  for (int i = 0; i < emit_count; ++i) to_emit[i] = indices[i];
+  g_mutex_unlock(&s->lock);
+  for (int i = 0; i < emit_count; ++i) {
+    emit_evt(s, SPLASH_EVT_QUEUED_NEXT, to_emit[i], 0, NULL);
+  }
+  return true;
 }
 
 int splash_find_index_by_name(Splash *s, const char *name){
