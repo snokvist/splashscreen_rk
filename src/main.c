@@ -398,7 +398,7 @@ static GSocket *create_udp_probe_socket(guint16 port){
   g_socket_set_blocking(sock, FALSE);
   GInetAddress *addr = g_inet_address_new_any(G_SOCKET_FAMILY_IPV4);
   GSocketAddress *saddr = g_inet_socket_address_new(addr, port);
-  g_inet_address_unref(addr);
+  g_object_unref(addr);
   if (!g_socket_bind(sock, saddr, TRUE, &error)){
     fprintf(stderr, "[failover] unable to bind UDP probe on port %u: %s\n",
             port, error ? error->message : "unknown error");
