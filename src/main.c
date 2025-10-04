@@ -110,16 +110,24 @@ static gboolean load_config(const char *path,
   GKeyFile *kf = g_key_file_new();
   if (!kf) return FALSE;
 
-  gchar *config_dir = g_path_get_dirname(path);
-  if (!config_dir) {
+  gchar *config_abs = g_canonicalize_filename(path, NULL);
+  if (!config_abs) {
     g_key_file_free(kf);
     return FALSE;
   }
 
-  if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, &error)) {
+  gchar *config_dir = g_path_get_dirname(config_abs);
+  if (!config_dir) {
+    g_free(config_abs);
+    g_key_file_free(kf);
+    return FALSE;
+  }
+
+  if (!g_key_file_load_from_file(kf, config_abs, G_KEY_FILE_NONE, &error)) {
     fprintf(stderr, "Failed to read config '%s': %s\n", path,
             error ? error->message : "unknown error");
     if (error) g_error_free(error);
+    g_free(config_abs);
     g_free(config_dir);
     g_key_file_free(kf);
     return FALSE;
@@ -127,6 +135,7 @@ static gboolean load_config(const char *path,
 
   GPtrArray *owned_strings = g_ptr_array_new_with_free_func(g_free);
   if (!owned_strings) {
+    g_free(config_abs);
     g_free(config_dir);
     g_key_file_free(kf);
     return FALSE;
@@ -228,6 +237,7 @@ done:
   if (!ok) {
     g_ptr_array_free(owned_strings, TRUE);
   }
+  g_free(config_abs);
   g_free(config_dir);
   g_key_file_free(kf);
   return ok;
