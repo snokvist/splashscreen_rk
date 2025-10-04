@@ -445,6 +445,25 @@ bool splash_enqueue_next_many(Splash *s, const int *indices, int n_indices){
   return true;
 }
 
+bool splash_enqueue_with_repeat(Splash *s,
+                                const int *indices,
+                                int n_indices,
+                                SplashRepeatMode repeat){
+  if (!s || !indices || n_indices <= 0) return false;
+  if (!splash_enqueue_next_many(s, indices, n_indices)) return false;
+
+  if (repeat == SPLASH_REPEAT_FULL) {
+    splash_set_repeat_order(s, indices, n_indices);
+  } else if (repeat == SPLASH_REPEAT_LAST) {
+    int last = indices[n_indices - 1];
+    splash_set_repeat_order(s, &last, 1);
+  } else {
+    splash_set_repeat_order(s, NULL, 0);
+  }
+
+  return true;
+}
+
 int splash_find_index_by_name(Splash *s, const char *name){
   int idx=-1;
   g_mutex_lock(&s->lock);

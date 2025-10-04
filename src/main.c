@@ -187,8 +187,10 @@ static gboolean handle_http_path(AppCtx *ctx,
     if (decoded && decoded[0] != '\0') {
       int idx = splash_find_index_by_name(ctx->splash, decoded);
       if (idx >= 0) {
-        if (splash_enqueue_next_by_index(ctx->splash, idx)) {
-          splash_set_repeat_order(ctx->splash, NULL, 0);
+        if (splash_enqueue_with_repeat(ctx->splash,
+                                       &idx,
+                                       1,
+                                       SPLASH_REPEAT_NONE)) {
           gchar *escaped = json_escape(decoded);
           GString *body = g_string_new("{\"status\":\"queued\",\"name\":\"");
           g_string_append(body, escaped);
@@ -206,17 +208,14 @@ static gboolean handle_http_path(AppCtx *ctx,
       } else {
         ComboSeq *combo = find_combo_by_name(ctx, decoded);
         if (combo && combo->count > 0) {
-          if (splash_enqueue_next_many(ctx->splash, combo->indices, combo->count)) {
-            if (combo->loop_at_end) {
-              if (ctx->combo_loop_full) {
-                splash_set_repeat_order(ctx->splash, combo->indices, combo->count);
-              } else {
-                splash_set_repeat_order(ctx->splash,
-                                        &combo->indices[combo->count - 1], 1);
-              }
-            } else {
-              splash_set_repeat_order(ctx->splash, NULL, 0);
-            }
+          SplashRepeatMode repeat = SPLASH_REPEAT_NONE;
+          if (combo->loop_at_end) {
+            repeat = ctx->combo_loop_full ? SPLASH_REPEAT_FULL : SPLASH_REPEAT_LAST;
+          }
+          if (splash_enqueue_with_repeat(ctx->splash,
+                                         combo->indices,
+                                         combo->count,
+                                         repeat)) {
             gchar *escaped = json_escape(decoded);
             GString *body = g_string_new("{\"status\":\"queued_combo\",\"name\":\"");
             g_string_append(body, escaped);
@@ -335,9 +334,10 @@ static gboolean on_stdin_ready(GIOChannel *source, GIOCondition condition, gpoin
     } else if (ch >= '1' && ch <= '9') {
       int idx = ch - '1';
       if (idx < ctx->sequence_count) {
-        if (splash_enqueue_next_by_index(ctx->splash, idx)) {
-          splash_set_repeat_order(ctx->splash, NULL, 0);
-        }
+        splash_enqueue_with_repeat(ctx->splash,
+                                   &idx,
+                                   1,
+                                   SPLASH_REPEAT_NONE);
       }
     }
   }

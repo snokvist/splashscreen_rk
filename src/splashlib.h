@@ -65,6 +65,24 @@ void splash_stop(Splash *s);   // stops pipelines
 bool splash_enqueue_next_by_index(Splash *s, int idx);
 bool splash_enqueue_next_by_name(Splash *s, const char *name);
 bool splash_enqueue_next_many(Splash *s, const int *indices, int n_indices);
+
+// Convenience helper for the common "enqueue + choose repeat" workflow. The
+// repeat behavior controls what happens after the queued items finish:
+//   SPLASH_REPEAT_NONE  -> disable any custom repeat order.
+//   SPLASH_REPEAT_LAST  -> loop the last queued index indefinitely.
+//   SPLASH_REPEAT_FULL  -> loop the full queued order.
+// Returns false if queuing fails (invalid indices or queue full).
+typedef enum {
+  SPLASH_REPEAT_NONE = 0,
+  SPLASH_REPEAT_LAST,
+  SPLASH_REPEAT_FULL,
+} SplashRepeatMode;
+
+bool splash_enqueue_with_repeat(Splash *s,
+                                const int *indices,
+                                int n_indices,
+                                SplashRepeatMode repeat);
+
 void splash_clear_next(Splash *s);
 
 // Configure automatic looping order once the queue drains. Passing NULL or
