@@ -15,6 +15,7 @@
 #ifdef __linux__
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
+#include <linux/filter.h>
 #include <net/if.h>
 #endif
 
@@ -456,6 +457,7 @@ static void monitor_set_external_state(AppCtx *ctx,
 }
 
 #ifdef __linux__
+static gboolean apply_udp_monitor_filter(int fd, guint16 port);
 static void teardown_udp_monitor(AppCtx *ctx);
 
 static gboolean on_monitor_ready(GIOChannel *chan, GIOCondition cond, gpointer user_data) {
@@ -523,6 +525,51 @@ static gboolean on_monitor_tick(gpointer user_data) {
   return G_SOURCE_CONTINUE;
 }
 
+static gboolean apply_udp_monitor_filter(int fd, guint16 port) {
+  if (fd < 0 || port == 0) return FALSE;
+  guint16 port_be = htons(port);
+  guint16 eth_ip = htons(ETH_P_IP);
+  guint16 eth_vlan = htons(ETH_P_8021Q);
+  struct sock_filter filter[] = {
+    BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 12),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 9, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 7),
+    BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 23),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_UDP, 0, 5),
+    BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 20),
+    BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x1fff, 3, 0),
+    BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 36),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, 0xFFFF),
+    BPF_STMT(BPF_RET | BPF_K, 0),
+    BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 16),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 7),
+    BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 27),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, IPPROTO_UDP, 0, 5),
+    BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 24),
+    BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, 0x1fff, 3, 0),
+    BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 40),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, 0xFFFF),
+    BPF_STMT(BPF_RET | BPF_K, 0),
+  };
+  filter[1].k = eth_vlan;
+  filter[2].k = eth_ip;
+  filter[8].k = port_be;
+  filter[12].k = eth_ip;
+  filter[18].k = port_be;
+  struct sock_fprog prog = {
+    .len = (unsigned short)G_N_ELEMENTS(filter),
+    .filter = filter,
+  };
+  if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) < 0) {
+    fprintf(stderr, "UDP monitor could not install BPF filter: %s\n",
+            g_strerror(errno));
+    return FALSE;
+  }
+  return TRUE;
+}
+
 static gboolean setup_udp_monitor(AppCtx *ctx) {
   if (!ctx || !ctx->monitor_enabled) return FALSE;
   int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
@@ -551,6 +598,13 @@ static gboolean setup_udp_monitor(AppCtx *ctx) {
       ctx->monitor_enabled = FALSE;
       return FALSE;
     }
+  }
+  if (!apply_udp_monitor_filter(fd, ctx->monitor_port)) {
+    fprintf(stderr, "UDP monitor failed to apply capture filter for port %u.\n",
+            ctx->monitor_port);
+    close(fd);
+    ctx->monitor_enabled = FALSE;
+    return FALSE;
   }
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
