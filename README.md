@@ -7,8 +7,8 @@ predefined combo playlists.
 
 ## Requirements
 
-Install the development toolchain and GStreamer components before building.
-Python 3 is also required so the build can extract the bundled demo asset:
+Install the development toolchain, GStreamer components, and GNU gzip before
+building so the asset extraction rule can unpack the bundled demo stream:
 
 ```sh
 sudo apt-get update
@@ -16,7 +16,8 @@ sudo apt-get install -y \
   build-essential pkg-config \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libgstrtspserver-1.0-dev \
-  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  gzip
 ```
 
 ## Building
