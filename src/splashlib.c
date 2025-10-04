@@ -46,6 +46,8 @@ struct Splash {
   GstRTSPMediaFactory *rtsp_factory;
   GstElement *appsrc_rtsp;
 
+  GstCaps *current_caps;
+
   // Timing
   GstClockTime next_pts;
 
@@ -151,23 +153,49 @@ static gboolean on_reader_bus(GstBus *bus, GstMessage *m, gpointer user) {
 
 static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user) {
   Splash *s = (Splash*)user;
-  GstElement *as = current_appsrc(s);
-  if (!as) return GST_FLOW_OK;
 
   GstSample *samp = gst_app_sink_pull_sample(sink);
   if (!samp) return GST_FLOW_EOS;
+
+  GstCaps *caps = gst_sample_get_caps(samp);
   GstBuffer *inbuf = gst_sample_get_buffer(samp);
 
-  GstBuffer *out = gst_buffer_copy_deep(inbuf);
-
   g_mutex_lock(&s->lock);
-  GST_BUFFER_PTS(out)      = s->next_pts;
-  GST_BUFFER_DTS(out)      = GST_CLOCK_TIME_NONE;
-  GST_BUFFER_DURATION(out) = s->dur;
+
+  if (caps) {
+    if (!s->current_caps || !gst_caps_is_equal(caps, s->current_caps)) {
+      if (s->current_caps) gst_caps_unref(s->current_caps);
+      s->current_caps = gst_caps_copy(caps);
+      if (s->appsrc_udp)
+        gst_app_src_set_caps(GST_APP_SRC(s->appsrc_udp), s->current_caps);
+      if (s->appsrc_rtsp)
+        gst_app_src_set_caps(GST_APP_SRC(s->appsrc_rtsp), s->current_caps);
+    }
+  }
+
+  GstElement *as = current_appsrc(s);
+  if (!as) {
+    g_mutex_unlock(&s->lock);
+    gst_sample_unref(samp);
+    return GST_FLOW_OK;
+  }
+
+  gst_object_ref(as);
+
+  GstClockTime pts = s->next_pts;
+  GstClockTime dur = s->dur;
   s->next_pts += s->dur;
+
   g_mutex_unlock(&s->lock);
 
+  GstBuffer *out = gst_buffer_copy_deep(inbuf);
+  GST_BUFFER_PTS(out)      = pts;
+  GST_BUFFER_DTS(out)      = GST_CLOCK_TIME_NONE;
+  GST_BUFFER_DURATION(out) = dur;
+
   GstFlowReturn fr = gst_app_src_push_buffer(GST_APP_SRC(as), out);
+
+  gst_object_unref(as);
   gst_sample_unref(samp);
   return fr;
 }
@@ -183,6 +211,8 @@ static void on_media_configure(GstRTSPMediaFactory *factory, GstRTSPMedia *media
   s->appsrc_rtsp = gst_bin_get_by_name(GST_BIN(bin), "src");
   g_object_set(s->appsrc_rtsp, "is-live", TRUE, "format", GST_FORMAT_TIME,
                "block", TRUE, "do-timestamp", FALSE, NULL);
+  if (s->current_caps)
+    gst_app_src_set_caps(GST_APP_SRC(s->appsrc_rtsp), s->current_caps);
   g_printerr("[rtsp] media-configure: appsrc ready\n");
   gst_object_unref(bin);
 }
@@ -199,6 +229,7 @@ static void destroy_pipelines_locked(Splash *s){
 
   if (s->rtsp_server){ g_object_unref(s->rtsp_server); s->rtsp_server=NULL; }
   s->rtsp_factory=NULL; s->appsrc_rtsp=NULL;
+  if (s->current_caps){ gst_caps_unref(s->current_caps); s->current_caps=NULL; }
 }
 
 static gboolean build_pipelines_locked(Splash *s, GError **err){
@@ -229,6 +260,8 @@ static gboolean build_pipelines_locked(Splash *s, GError **err){
     s->sender_udp = gst_parse_launch(sdesc, err); g_free(sdesc);
     if (!s->sender_udp) return FALSE;
     s->appsrc_udp = gst_bin_get_by_name(GST_BIN(s->sender_udp), "src");
+    if (s->current_caps)
+      gst_app_src_set_caps(GST_APP_SRC(s->appsrc_udp), s->current_caps);
   } else {
     // RTSP server (allow UDP and TCP interleaved for compatibility)
     s->rtsp_server = gst_rtsp_server_new();
