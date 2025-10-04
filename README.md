@@ -7,7 +7,8 @@ predefined combo playlists.
 
 ## Requirements
 
-Install the development toolchain and GStreamer components before building:
+Install the development toolchain and GStreamer components before building.
+Python 3 is also required so the build can extract the bundled demo asset:
 
 ```sh
 sudo apt-get update

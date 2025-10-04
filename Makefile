@@ -46,7 +46,7 @@ $(OBJDIR):
 
 $(ASSET_OUT): $(ASSET_ZIP)
 	@echo "Unpacking $<"
-	unzip -o $< $(ASSET_OUT)
+	python3 -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract(sys.argv[2])" $< $(ASSET_OUT)
 
 # Convenience run targets (adjust args as needed)
 run-udp: $(APP)
