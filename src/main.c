@@ -110,16 +110,24 @@ static gboolean load_config(const char *path,
   GKeyFile *kf = g_key_file_new();
   if (!kf) return FALSE;
 
+  gchar *config_dir = g_path_get_dirname(path);
+  if (!config_dir) {
+    g_key_file_free(kf);
+    return FALSE;
+  }
+
   if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, &error)) {
     fprintf(stderr, "Failed to read config '%s': %s\n", path,
             error ? error->message : "unknown error");
     if (error) g_error_free(error);
+    g_free(config_dir);
     g_key_file_free(kf);
     return FALSE;
   }
 
   GPtrArray *owned_strings = g_ptr_array_new_with_free_func(g_free);
   if (!owned_strings) {
+    g_free(config_dir);
     g_key_file_free(kf);
     return FALSE;
   }
@@ -131,8 +139,21 @@ static gboolean load_config(const char *path,
     g_error_free(error);
     goto done;
   }
-  g_ptr_array_add(owned_strings, input);
-  cfg->input_path = input;
+  gchar *resolved_input = g_canonicalize_filename(input, config_dir);
+  if (!resolved_input) {
+    fprintf(stderr, "Failed to resolve stream.input path '%s'\n", input);
+    g_free(input);
+    goto done;
+  }
+  g_free(input);
+  if (!g_file_test(resolved_input, G_FILE_TEST_EXISTS)) {
+    fprintf(stderr, "Configured input file '%s' does not exist\n",
+            resolved_input);
+    g_free(resolved_input);
+    goto done;
+  }
+  g_ptr_array_add(owned_strings, resolved_input);
+  cfg->input_path = resolved_input;
 
   error = NULL;
   cfg->fps = g_key_file_get_double(kf, "stream", "fps", &error);
@@ -207,6 +228,7 @@ done:
   if (!ok) {
     g_ptr_array_free(owned_strings, TRUE);
   }
+  g_free(config_dir);
   g_key_file_free(kf);
   return ok;
 }
