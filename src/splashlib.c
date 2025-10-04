@@ -295,6 +295,8 @@ static void on_media_configure(GstRTSPMediaFactory *factory, GstRTSPMedia *media
   g_signal_connect(media, "prepared", G_CALLBACK(on_media_prepared), s);
   g_signal_connect(media, "unprepared", G_CALLBACK(on_media_unprepared), s);
   g_printerr("[rtsp] media-configure\n");
+  if (gst_rtsp_media_is_prepared(media))
+    on_media_prepared(media, s);
 }
 
 // ------------------------------------------------------------------
