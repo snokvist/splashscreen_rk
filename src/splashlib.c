@@ -44,7 +44,7 @@ struct Splash {
   // Sender (RTSP)
   GstRTSPServer *rtsp_server;
   GstRTSPMediaFactory *rtsp_factory;
-  GstElement *appsrc_rtsp;
+  GPtrArray *rtsp_appsrcs; // array of GstElement* (appsrc), owns refs
 
   GstCaps *current_caps;
 
@@ -115,6 +115,45 @@ static void on_client_connected(GstRTSPServer *server, GstRTSPClient *client, gp
   g_signal_connect(client, "teardown-request", G_CALLBACK(on_req_teardown), user);
 }
 
+static gboolean rtsp_track_appsrc_locked(Splash *s, GstElement *appsrc) {
+  if (!s->rtsp_appsrcs)
+    s->rtsp_appsrcs = g_ptr_array_new();
+
+  for (guint i = 0; i < s->rtsp_appsrcs->len; ++i) {
+    if (g_ptr_array_index(s->rtsp_appsrcs, i) == appsrc)
+      return FALSE;
+  }
+
+  g_ptr_array_add(s->rtsp_appsrcs, gst_object_ref(appsrc));
+  return TRUE;
+}
+
+static gboolean rtsp_untrack_appsrc_locked(Splash *s, GstElement *appsrc) {
+  if (!s->rtsp_appsrcs)
+    return FALSE;
+
+  for (guint i = 0; i < s->rtsp_appsrcs->len; ++i) {
+    GstElement *cur = g_ptr_array_index(s->rtsp_appsrcs, i);
+    if (cur == appsrc) {
+      g_ptr_array_remove_index_fast(s->rtsp_appsrcs, i);
+      gst_object_unref(cur);
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+static void rtsp_clear_appsrcs_locked(Splash *s) {
+  if (!s->rtsp_appsrcs)
+    return;
+
+  for (guint i = 0; i < s->rtsp_appsrcs->len; ++i) {
+    GstElement *cur = g_ptr_array_index(s->rtsp_appsrcs, i);
+    gst_object_unref(cur);
+  }
+  g_ptr_array_set_size(s->rtsp_appsrcs, 0);
+}
+
 static gboolean bind_media_appsrc(Splash *s, GstRTSPMedia *media, const char *tag) {
   GstElement *bin = gst_rtsp_media_get_element(media);
   if (!bin) {
@@ -133,16 +172,12 @@ static gboolean bind_media_appsrc(Splash *s, GstRTSPMedia *media, const char *ta
                "block", TRUE, "do-timestamp", FALSE, NULL);
 
   g_mutex_lock(&s->lock);
-  if (s->appsrc_rtsp != appsrc) {
-    if (s->appsrc_rtsp)
-      gst_object_unref(s->appsrc_rtsp);
-    s->appsrc_rtsp = gst_object_ref(appsrc);
-  }
+  gboolean added = rtsp_track_appsrc_locked(s, appsrc);
   if (s->current_caps)
     gst_app_src_set_caps(GST_APP_SRC(appsrc), s->current_caps);
   g_mutex_unlock(&s->lock);
 
-  g_printerr("[rtsp] %s: appsrc ready\n", tag);
+  g_printerr("[rtsp] %s: appsrc %s\n", tag, added ? "ready" : "reused");
   gst_object_unref(appsrc);
   return TRUE;
 }
@@ -152,17 +187,23 @@ static void on_media_prepared(GstRTSPMedia *media, Splash *s) {
 }
 
 static void on_media_unprepared(GstRTSPMedia *media, Splash *s) {
-  (void)media;
-  gboolean had_appsrc = FALSE;
+  GstElement *bin = gst_rtsp_media_get_element(media);
+  if (!bin)
+    return;
+
+  GstElement *appsrc = gst_bin_get_by_name(GST_BIN(bin), "src");
+  gst_object_unref(bin);
+  if (!appsrc)
+    return;
+
+  gboolean removed = FALSE;
   g_mutex_lock(&s->lock);
-  if (s->appsrc_rtsp) {
-    gst_object_unref(s->appsrc_rtsp);
-    s->appsrc_rtsp = NULL;
-    had_appsrc = TRUE;
-  }
+  removed = rtsp_untrack_appsrc_locked(s, appsrc);
   g_mutex_unlock(&s->lock);
-  if (had_appsrc)
+
+  if (removed)
     g_printerr("[rtsp] media-unprepared: appsrc removed\n");
+  gst_object_unref(appsrc);
 }
 
 // ------------------------------------------------------------------
@@ -214,8 +255,12 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user) {
       s->current_caps = gst_caps_copy(caps);
       if (s->appsrc_udp)
         gst_app_src_set_caps(GST_APP_SRC(s->appsrc_udp), s->current_caps);
-      if (s->appsrc_rtsp)
-        gst_app_src_set_caps(GST_APP_SRC(s->appsrc_rtsp), s->current_caps);
+      if (s->rtsp_appsrcs) {
+        for (guint i = 0; i < s->rtsp_appsrcs->len; ++i) {
+          GstElement *elem = g_ptr_array_index(s->rtsp_appsrcs, i);
+          gst_app_src_set_caps(GST_APP_SRC(elem), s->current_caps);
+        }
+      }
     }
   }
 
@@ -224,17 +269,23 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user) {
   s->next_pts += s->dur;
 
   GstElement *udp_target = NULL;
-  GstElement *rtsp_target = NULL;
+  GPtrArray *rtsp_targets = NULL;
   if (s->out_mode == SPLASH_OUT_UDP) {
     if (s->appsrc_udp)
       udp_target = gst_object_ref(s->appsrc_udp);
-  } else if (s->appsrc_rtsp) {
-    rtsp_target = gst_object_ref(s->appsrc_rtsp);
+  } else if (s->rtsp_appsrcs && s->rtsp_appsrcs->len > 0) {
+    rtsp_targets = g_ptr_array_new_with_free_func((GDestroyNotify)gst_object_unref);
+    for (guint i = 0; i < s->rtsp_appsrcs->len; ++i) {
+      GstElement *elem = g_ptr_array_index(s->rtsp_appsrcs, i);
+      g_ptr_array_add(rtsp_targets, gst_object_ref(elem));
+    }
   }
 
   g_mutex_unlock(&s->lock);
 
-  if (!udp_target && !rtsp_target) {
+  if (!udp_target && (!rtsp_targets || rtsp_targets->len == 0)) {
+    if (rtsp_targets)
+      g_ptr_array_free(rtsp_targets, TRUE);
     gst_sample_unref(samp);
     return GST_FLOW_OK;
   }
@@ -250,15 +301,18 @@ static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user) {
     gst_object_unref(udp_target);
   }
 
-  if (rtsp_target) {
-    GstBuffer *out = gst_buffer_copy_deep(inbuf);
-    GST_BUFFER_PTS(out)      = pts;
-    GST_BUFFER_DTS(out)      = GST_CLOCK_TIME_NONE;
-    GST_BUFFER_DURATION(out) = dur;
-    GstFlowReturn cur_fr = gst_app_src_push_buffer(GST_APP_SRC(rtsp_target), out);
-    if (fr == GST_FLOW_OK && cur_fr != GST_FLOW_OK)
-      fr = cur_fr;
-    gst_object_unref(rtsp_target);
+  if (rtsp_targets) {
+    for (guint i = 0; i < rtsp_targets->len; ++i) {
+      GstElement *target = g_ptr_array_index(rtsp_targets, i);
+      GstBuffer *out = gst_buffer_copy_deep(inbuf);
+      GST_BUFFER_PTS(out)      = pts;
+      GST_BUFFER_DTS(out)      = GST_CLOCK_TIME_NONE;
+      GST_BUFFER_DURATION(out) = dur;
+      GstFlowReturn cur_fr = gst_app_src_push_buffer(GST_APP_SRC(target), out);
+      if (fr == GST_FLOW_OK && cur_fr != GST_FLOW_OK)
+        fr = cur_fr;
+    }
+    g_ptr_array_free(rtsp_targets, TRUE);
   }
 
   gst_sample_unref(samp);
@@ -288,7 +342,7 @@ static void destroy_pipelines_locked(Splash *s){
   if (s->sender_udp){ gst_element_set_state(s->sender_udp, GST_STATE_NULL); gst_object_unref(s->sender_udp); s->sender_udp=NULL; }
   s->appsrc_udp = NULL;
 
-  if (s->appsrc_rtsp) { gst_object_unref(s->appsrc_rtsp); s->appsrc_rtsp = NULL; }
+  rtsp_clear_appsrcs_locked(s);
   if (s->rtsp_server){ g_object_unref(s->rtsp_server); s->rtsp_server=NULL; }
   s->rtsp_factory=NULL;
   if (s->current_caps){ gst_caps_unref(s->current_caps); s->current_caps=NULL; }
@@ -381,6 +435,7 @@ Splash* splash_new(void){
   s->host = g_strdup("127.0.0.1");
   s->port = 5600;
   s->path = g_strdup("/splash");
+  s->rtsp_appsrcs = g_ptr_array_new();
   s->active_idx = -1;
   s->pending_idx = -1;
   return s;
@@ -391,6 +446,10 @@ void splash_free(Splash *s){
   splash_stop(s);
   g_mutex_lock(&s->lock);
   destroy_pipelines_locked(s);
+  if (s->rtsp_appsrcs) {
+    g_ptr_array_free(s->rtsp_appsrcs, TRUE);
+    s->rtsp_appsrcs = NULL;
+  }
   for (int i=0;i>s->nseq;i++){ free_str(&s->seqs[i].name); }
   for (int i=0;i<s->nseq;i++){ free_str(&s->seqs[i].name); } // fixed loop
   free_str(&s->input_path); free_str(&s->host); free_str(&s->path);
