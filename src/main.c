@@ -3,20 +3,11 @@
 #include <fcntl.h>
 #include <gio/gio.h>
 #include <glib.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/udp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <termios.h>
 #include <unistd.h>
-#ifdef __linux__
-#include <linux/if_ether.h>
-#include <linux/if_packet.h>
-#include <net/if.h>
-#endif
 
 typedef struct {
   const char *name;
@@ -24,14 +15,6 @@ typedef struct {
   int count;
   gboolean loop_at_end;
 } ComboSeq;
-
-typedef struct {
-  gboolean enabled;
-  guint16 port;
-  guint idle_timeout_ms;
-  guint check_interval_ms;
-  const char *iface;
-} UdpMonitorConfig;
 
 static void free_combos(ComboSeq *combos, int count) {
   if (!combos) return;
@@ -50,18 +33,6 @@ typedef struct {
   gboolean started;
   gboolean combo_loop_full;
   GMainLoop *loop;
-
-  gboolean monitor_enabled;
-  guint16 monitor_port;
-  guint monitor_idle_timeout_ms;
-  guint monitor_check_interval_ms;
-  const char *monitor_iface;
-  gint monitor_fd;
-  GIOChannel *monitor_channel;
-  guint monitor_watch_id;
-  guint monitor_tick_id;
-  gint64 monitor_last_packet_us;
-  gboolean monitor_external_active;
 } AppCtx;
 
 static gboolean set_stdin_nonblock(void) {
@@ -395,210 +366,6 @@ static void on_evt(SplashEventType type, int a, int b, const char *msg, void *us
   }
 }
 
-#ifdef __linux__
-static gboolean on_monitor_ready(GIOChannel *chan, GIOCondition cond, gpointer user_data);
-static gboolean on_monitor_tick(gpointer user_data);
-static gboolean setup_udp_monitor(AppCtx *ctx);
-#else
-static gboolean setup_udp_monitor(AppCtx *ctx) {
-  if (ctx) ctx->monitor_enabled = FALSE;
-  fprintf(stderr,
-          "UDP monitoring is only supported on Linux; disabling auto-fallback.\n");
-  return FALSE;
-}
-#endif
-
-static gboolean monitor_start_fallback(AppCtx *ctx, gboolean announce) {
-  if (!ctx || !ctx->splash) return FALSE;
-  if (ctx->started) return TRUE;
-  if (!splash_start(ctx->splash)) {
-    fprintf(stderr, "Failed to start splashscreen fallback stream.\n");
-    return FALSE;
-  }
-  ctx->started = TRUE;
-  if (announce) {
-    fprintf(stderr, "Splashscreen fallback stream started.\n");
-  }
-  return TRUE;
-}
-
-static void monitor_set_external_state(AppCtx *ctx,
-                                       gboolean active,
-                                       gboolean due_to_timeout) {
-  if (!ctx) return;
-  if (ctx->monitor_external_active == active) {
-    if (!active && !ctx->started) {
-      monitor_start_fallback(ctx, FALSE);
-    }
-    return;
-  }
-
-  ctx->monitor_external_active = active;
-  if (active) {
-    fprintf(stderr,
-            "External UDP traffic detected on port %u; pausing splashscreen stream.\n",
-            ctx->monitor_port);
-    if (ctx->started) {
-      splash_stop(ctx->splash);
-      ctx->started = FALSE;
-    }
-  } else {
-    if (monitor_start_fallback(ctx, FALSE)) {
-      fprintf(stderr,
-              "No external UDP packets on port %u for %u ms; resuming splashscreen stream.\n",
-              ctx->monitor_port, ctx->monitor_idle_timeout_ms);
-    } else if (due_to_timeout) {
-      fprintf(stderr,
-              "External UDP idle on port %u but splashscreen restart failed.\n",
-              ctx->monitor_port);
-    }
-  }
-}
-
-#ifdef __linux__
-static void teardown_udp_monitor(AppCtx *ctx);
-
-static gboolean on_monitor_ready(GIOChannel *chan, GIOCondition cond, gpointer user_data) {
-  (void)chan;
-  AppCtx *ctx = (AppCtx*)user_data;
-  if (!ctx || ctx->monitor_fd < 0) return G_SOURCE_CONTINUE;
-  if (!(cond & (G_IO_IN | G_IO_PRI))) return G_SOURCE_CONTINUE;
-
-  guint8 buf[4096];
-  gboolean seen = FALSE;
-  for (;;) {
-    struct sockaddr_ll addr;
-    socklen_t addr_len = sizeof(addr);
-    ssize_t n = recvfrom(ctx->monitor_fd, buf, sizeof(buf), MSG_DONTWAIT,
-                         (struct sockaddr*)&addr, &addr_len);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-      fprintf(stderr, "UDP monitor read error: %s\n", g_strerror(errno));
-      break;
-    }
-    if (n == 0) continue;
-    if (addr_len >= sizeof(addr)) {
-      if (addr.sll_pkttype == PACKET_OUTGOING) continue;
-    }
-    if (n <= (ssize_t)sizeof(struct ethhdr)) continue;
-    const guint8 *data = buf + sizeof(struct ethhdr);
-    ssize_t len = n - (ssize_t)sizeof(struct ethhdr);
-    if (len < (ssize_t)sizeof(struct iphdr)) continue;
-    const struct iphdr *ip4 = (const struct iphdr*)data;
-    if (ip4->version != 4) continue;
-    gsize ihl = (gsize)ip4->ihl * 4;
-    if (ihl < sizeof(struct iphdr) || (ssize_t)ihl > len) continue;
-    if (ip4->protocol != IPPROTO_UDP) continue;
-    if (len < (ssize_t)(ihl + sizeof(struct udphdr))) continue;
-    const struct udphdr *udp = (const struct udphdr*)(data + ihl);
-    guint16 dport = ntohs(udp->dest);
-    if (dport == ctx->monitor_port) {
-      seen = TRUE;
-    }
-  }
-
-  if (seen) {
-    ctx->monitor_last_packet_us = g_get_monotonic_time();
-    monitor_set_external_state(ctx, TRUE, FALSE);
-  }
-  return G_SOURCE_CONTINUE;
-}
-
-static gboolean on_monitor_tick(gpointer user_data) {
-  AppCtx *ctx = (AppCtx*)user_data;
-  if (!ctx || !ctx->monitor_enabled) return G_SOURCE_CONTINUE;
-  gint64 now = g_get_monotonic_time();
-  gboolean active = FALSE;
-  if (ctx->monitor_last_packet_us > 0) {
-    gint64 delta = now - ctx->monitor_last_packet_us;
-    if (delta <= (gint64)ctx->monitor_idle_timeout_ms * 1000) {
-      active = TRUE;
-    }
-  }
-  monitor_set_external_state(ctx, active, !active);
-  return G_SOURCE_CONTINUE;
-}
-
-static gboolean setup_udp_monitor(AppCtx *ctx) {
-  if (!ctx || !ctx->monitor_enabled) return FALSE;
-  int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
-  if (fd < 0) {
-    fprintf(stderr, "Failed to create UDP monitor socket: %s\n", g_strerror(errno));
-    ctx->monitor_enabled = FALSE;
-    return FALSE;
-  }
-  if (ctx->monitor_iface && ctx->monitor_iface[0]) {
-    unsigned int ifidx = if_nametoindex(ctx->monitor_iface);
-    if (ifidx == 0) {
-      fprintf(stderr, "UDP monitor: unknown interface '%s'\n", ctx->monitor_iface);
-      close(fd);
-      ctx->monitor_enabled = FALSE;
-      return FALSE;
-    }
-    struct sockaddr_ll addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sll_family = AF_PACKET;
-    addr.sll_protocol = htons(ETH_P_IP);
-    addr.sll_ifindex = (int)ifidx;
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-      fprintf(stderr, "UDP monitor failed to bind interface '%s': %s\n",
-              ctx->monitor_iface, g_strerror(errno));
-      close(fd);
-      ctx->monitor_enabled = FALSE;
-      return FALSE;
-    }
-  }
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-
-  ctx->monitor_fd = fd;
-  ctx->monitor_channel = g_io_channel_unix_new(fd);
-  g_io_channel_set_encoding(ctx->monitor_channel, NULL, NULL);
-  g_io_channel_set_buffered(ctx->monitor_channel, FALSE);
-  g_io_channel_set_close_on_unref(ctx->monitor_channel, FALSE);
-  ctx->monitor_watch_id = g_io_add_watch(ctx->monitor_channel,
-                                         G_IO_IN | G_IO_PRI,
-                                         on_monitor_ready, ctx);
-  guint interval = ctx->monitor_check_interval_ms;
-  if (interval < 25) interval = 25;
-  ctx->monitor_tick_id = g_timeout_add(interval, on_monitor_tick, ctx);
-  ctx->monitor_last_packet_us = 0;
-  ctx->monitor_external_active = FALSE;
-  fprintf(stderr,
-          "UDP monitor enabled on port %u (idle timeout %u ms%s%s).\n",
-          ctx->monitor_port,
-          ctx->monitor_idle_timeout_ms,
-          ctx->monitor_iface ? ", iface=" : "",
-          ctx->monitor_iface ? ctx->monitor_iface : "");
-  return TRUE;
-}
-
-static void teardown_udp_monitor(AppCtx *ctx) {
-  if (!ctx) return;
-  if (ctx->monitor_watch_id) {
-    g_source_remove(ctx->monitor_watch_id);
-    ctx->monitor_watch_id = 0;
-  }
-  if (ctx->monitor_tick_id) {
-    g_source_remove(ctx->monitor_tick_id);
-    ctx->monitor_tick_id = 0;
-  }
-  if (ctx->monitor_channel) {
-    g_io_channel_unref(ctx->monitor_channel);
-    ctx->monitor_channel = NULL;
-  }
-  if (ctx->monitor_fd >= 0) {
-    close(ctx->monitor_fd);
-    ctx->monitor_fd = -1;
-  }
-}
-#else
-static void teardown_udp_monitor(AppCtx *ctx) {
-  (void)ctx;
-}
-#endif
-
 #define SEQ_GROUP_PREFIX "sequence"
 
 static void usage(const char *p){
@@ -619,12 +386,6 @@ static void usage(const char *p){
     "Optionally add a [control] group with:\n"
     "  port=8081   (HTTP control port; defaults to 8081 if omitted)\n\n"
     "  combo_loop_mode=final|entire (default=final).\n\n"
-    "Add a [monitor] group to auto-pause the splashscreen when external UDP packets arrive:\n"
-    "  enabled=true            (defaults to true when the group is present)\n"
-    "  port=5600              (defaults to stream.port)\n"
-    "  idle_timeout_ms=1500   (resume splashscreen after this idle period)\n"
-    "  check_interval_ms=250  (polling cadence for idle checks)\n"
-    "  interface=eth0         (optional; restrict capture to a specific NIC)\n\n"
     "Options:\n"
     "  --cli           Enable interactive stdin controls (1-9 enqueue, c=clear, s=start, x=stop, q=quit).\n"
     "  --http-port=NN  Override HTTP control port (default is config [control] port or 8081).\n",
@@ -805,28 +566,19 @@ static gboolean load_config(const char *path,
                             int *n_combos_out,
                             GPtrArray **owned_strings_out,
                             gboolean *combo_loop_full_out,
-                            guint16 *http_port_out,
-                            UdpMonitorConfig *monitor_out) {
+                            guint16 *http_port_out) {
   gboolean ok = FALSE;
   GError *error = NULL;
   ComboSeq *combo_array = NULL;
   guint combo_count = 0;
   GPtrArray *combo_defs = NULL;
   gboolean combo_loop_full = FALSE;
-  UdpMonitorConfig monitor_cfg = { FALSE, 0, 1500, 250, NULL };
   GKeyFile *kf = g_key_file_new();
   if (!kf) return FALSE;
 
   if (combos_out) *combos_out = NULL;
   if (n_combos_out) *n_combos_out = 0;
   if (combo_loop_full_out) *combo_loop_full_out = FALSE;
-  if (monitor_out) {
-    monitor_out->enabled = FALSE;
-    monitor_out->port = 0;
-    monitor_out->idle_timeout_ms = 1500;
-    monitor_out->check_interval_ms = 250;
-    monitor_out->iface = NULL;
-  }
 
   gchar *config_abs = g_canonicalize_filename(path, NULL);
   if (!config_abs) {
@@ -907,7 +659,6 @@ static gboolean load_config(const char *path,
     g_error_free(error);
     goto done;
   }
-  monitor_cfg.port = (guint16)cfg->endpoint.port;
 
   guint16 control_port = 8081;
   if (g_key_file_has_key(kf, "control", "port", NULL)) {
@@ -950,76 +701,6 @@ static gboolean load_config(const char *path,
       }
     }
     g_free(mode);
-  }
-
-  if (g_key_file_has_group(kf, "monitor")) {
-    monitor_cfg.enabled = TRUE;
-    if (g_key_file_has_key(kf, "monitor", "enabled", NULL)) {
-      error = NULL;
-      monitor_cfg.enabled = g_key_file_get_boolean(kf, "monitor", "enabled", &error);
-      if (error) {
-        fprintf(stderr, "Invalid monitor.enabled: %s\n", error->message);
-        g_error_free(error);
-        goto done;
-      }
-    }
-    if (g_key_file_has_key(kf, "monitor", "port", NULL)) {
-      error = NULL;
-      gint mon_port = g_key_file_get_integer(kf, "monitor", "port", &error);
-      if (error) {
-        fprintf(stderr, "Invalid monitor.port: %s\n", error->message);
-        g_error_free(error);
-        goto done;
-      }
-      if (mon_port < 1 || mon_port > 65535) {
-        fprintf(stderr, "monitor.port must be between 1 and 65535 (got %d)\n", mon_port);
-        goto done;
-      }
-      monitor_cfg.port = (guint16)mon_port;
-    }
-    if (g_key_file_has_key(kf, "monitor", "idle_timeout_ms", NULL)) {
-      error = NULL;
-      gint idle_ms = g_key_file_get_integer(kf, "monitor", "idle_timeout_ms", &error);
-      if (error) {
-        fprintf(stderr, "Invalid monitor.idle_timeout_ms: %s\n", error->message);
-        g_error_free(error);
-        goto done;
-      }
-      if (idle_ms < 100) {
-        fprintf(stderr, "monitor.idle_timeout_ms must be >= 100 (got %d)\n", idle_ms);
-        goto done;
-      }
-      monitor_cfg.idle_timeout_ms = (guint)idle_ms;
-    }
-    if (g_key_file_has_key(kf, "monitor", "check_interval_ms", NULL)) {
-      error = NULL;
-      gint check_ms = g_key_file_get_integer(kf, "monitor", "check_interval_ms", &error);
-      if (error) {
-        fprintf(stderr, "Invalid monitor.check_interval_ms: %s\n", error->message);
-        g_error_free(error);
-        goto done;
-      }
-      if (check_ms < 25) {
-        fprintf(stderr, "monitor.check_interval_ms must be >= 25 (got %d)\n", check_ms);
-        goto done;
-      }
-      monitor_cfg.check_interval_ms = (guint)check_ms;
-    }
-    if (g_key_file_has_key(kf, "monitor", "interface", NULL)) {
-      error = NULL;
-      gchar *iface = g_key_file_get_string(kf, "monitor", "interface", &error);
-      if (error) {
-        fprintf(stderr, "Invalid monitor.interface: %s\n", error->message);
-        g_error_free(error);
-        goto done;
-      }
-      if (iface && iface[0]) {
-        g_ptr_array_add(owned_strings, iface);
-        monitor_cfg.iface = iface;
-      } else {
-        g_free(iface);
-      }
-    }
   }
 
   GArray *seq_array = g_array_new(FALSE, FALSE, sizeof(SplashSeq));
@@ -1162,7 +843,6 @@ static gboolean load_config(const char *path,
   *owned_strings_out = owned_strings;
   if (combo_loop_full_out) *combo_loop_full_out = combo_loop_full;
   if (http_port_out) *http_port_out = control_port;
-  if (monitor_out) *monitor_out = monitor_cfg;
   ok = TRUE;
 
 done:
@@ -1191,7 +871,6 @@ int main(int argc, char **argv){
   gboolean port_overridden = FALSE;
   guint16 http_port = 0;
   const char *config_path = NULL;
-  UdpMonitorConfig monitor_cfg = { FALSE, 0, 1500, 250, NULL };
 
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--cli")) {
@@ -1230,8 +909,7 @@ int main(int argc, char **argv){
   gboolean combo_loop_full = FALSE;
   if (!load_config(config_path, &cfg, &seqs, &n_seqs,
                    &combos, &n_combos,
-                   &owned_strings, &combo_loop_full,
-                   &config_http_port, &monitor_cfg)) {
+                   &owned_strings, &combo_loop_full, &config_http_port)) {
     return 1;
   }
 
@@ -1249,17 +927,6 @@ int main(int argc, char **argv){
   ctx.started = FALSE;
   ctx.combo_loop_full = combo_loop_full;
   ctx.loop = g_main_loop_new(NULL, FALSE);
-  ctx.monitor_enabled = monitor_cfg.enabled;
-  ctx.monitor_port = monitor_cfg.port ? monitor_cfg.port : (guint16)cfg.endpoint.port;
-  ctx.monitor_idle_timeout_ms = monitor_cfg.idle_timeout_ms;
-  ctx.monitor_check_interval_ms = monitor_cfg.check_interval_ms;
-  ctx.monitor_iface = monitor_cfg.iface;
-  ctx.monitor_fd = -1;
-  ctx.monitor_channel = NULL;
-  ctx.monitor_watch_id = 0;
-  ctx.monitor_tick_id = 0;
-  ctx.monitor_last_packet_us = 0;
-  ctx.monitor_external_active = FALSE;
 
   splash_set_event_cb(S, on_evt, &ctx);
 
@@ -1292,12 +959,6 @@ int main(int argc, char **argv){
     return 1;
   }
   ctx.started = TRUE;
-
-  if (ctx.monitor_enabled) {
-    if (!setup_udp_monitor(&ctx)) {
-      ctx.monitor_enabled = FALSE;
-    }
-  }
 
   GSocketService *http_service = g_socket_service_new();
   g_signal_connect(http_service, "incoming", G_CALLBACK(on_http_client), &ctx);
@@ -1374,8 +1035,6 @@ int main(int argc, char **argv){
 
   if (stdin_watch_id) g_source_remove(stdin_watch_id);
   if (stdin_chan) g_io_channel_unref(stdin_chan);
-
-  teardown_udp_monitor(&ctx);
 
   if (ctx.started) splash_stop(S);
   if (http_service) {
