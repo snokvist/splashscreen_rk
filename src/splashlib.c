@@ -123,6 +123,17 @@ static void on_client_connected(GstRTSPServer *server, GstRTSPClient *client, gp
   g_signal_connect(client, "teardown-request", G_CALLBACK(on_req_teardown), user);
 }
 
+static gboolean media_is_prepared(GstRTSPMedia *media) {
+#ifdef GST_RTSP_MEDIA_STATUS_PREPARED
+  GstRTSPMediaStatus status = GST_RTSP_MEDIA_STATUS_UNPREPARED;
+  g_object_get(media, "status", &status, NULL);
+  return status >= GST_RTSP_MEDIA_STATUS_PREPARED;
+#else
+  (void)media;
+  return FALSE;
+#endif
+}
+
 static void on_media_prepared(GstRTSPMedia *media, Splash *s) {
   GstElement *bin = gst_rtsp_media_get_element(media);
   if (!bin) return;
@@ -295,7 +306,7 @@ static void on_media_configure(GstRTSPMediaFactory *factory, GstRTSPMedia *media
   g_signal_connect(media, "prepared", G_CALLBACK(on_media_prepared), s);
   g_signal_connect(media, "unprepared", G_CALLBACK(on_media_unprepared), s);
   g_printerr("[rtsp] media-configure\n");
-  if (gst_rtsp_media_is_prepared(media))
+  if (media_is_prepared(media))
     on_media_prepared(media, s);
 }
 
