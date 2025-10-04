@@ -479,7 +479,10 @@ static gboolean on_monitor_ready(GIOChannel *chan, GIOCondition cond, gpointer u
     }
     if (n == 0) continue;
     if (addr_len >= sizeof(addr)) {
-      if (addr.sll_pkttype == PACKET_OUTGOING) continue;
+      if (addr.sll_pkttype == PACKET_OUTGOING ||
+          addr.sll_pkttype == PACKET_LOOPBACK) {
+        continue;
+      }
     }
     if (n <= (ssize_t)sizeof(struct ethhdr)) continue;
     const guint8 *data = buf + sizeof(struct ethhdr);
