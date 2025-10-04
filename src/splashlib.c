@@ -47,6 +47,12 @@ struct Splash {
   int pending_queue[MAX_QUEUE];   // FIFO of queued sequence indices
   int pending_count;              // number of valid entries in queue
 
+  // Automatic repeat order (optional)
+  int loop_order[MAX_QUEUE];
+  int loop_count;
+  guint64 queue_version;
+  guint64 loop_version;
+
   // Events
   SplashEventCb evt_cb;
   void *evt_user;
@@ -89,6 +95,19 @@ static gboolean on_reader_bus(GstBus *bus, GstMessage *m, gpointer user) {
         s->pending_count--;
         s->active_idx = next;
         emit_evt(s, SPLASH_EVT_SWITCHED_AT_BOUNDARY, from, s->active_idx, NULL);
+      } else if (s->loop_count > 0 && s->loop_version == s->queue_version) {
+        int from = s->active_idx;
+        int next = s->loop_order[0];
+        if (next >= 0 && next < s->nseq) {
+          s->active_idx = next;
+          s->pending_count = 0;
+          for (int i = 1; i < s->loop_count && i < MAX_QUEUE; ++i) {
+            s->pending_queue[s->pending_count++] = s->loop_order[i];
+          }
+          if (from != s->active_idx) {
+            emit_evt(s, SPLASH_EVT_SWITCHED_AT_BOUNDARY, from, s->active_idx, NULL);
+          }
+        }
       }
       do_segment_seek_locked(s, s->active_idx);
       g_mutex_unlock(&s->lock);
@@ -200,6 +219,9 @@ Splash* splash_new(void){
   s->port = 5600;
   s->active_idx = -1;
   s->pending_count = 0;
+  s->loop_count = 0;
+  s->queue_version = 0;
+  s->loop_version = 0;
   return s;
 }
 
@@ -254,6 +276,8 @@ bool splash_set_sequences(Splash *s, const SplashSeq *seqs, int n_seqs){
     }
   }
   s->pending_count = w;
+  s->loop_count = 0;
+  s->queue_version++;
 
   g_mutex_unlock(&s->lock);
   return true;
@@ -345,8 +369,39 @@ bool splash_enqueue_next_by_name(Splash *s, const char *name){
 void splash_clear_next(Splash *s){
   g_mutex_lock(&s->lock);
   s->pending_count = 0;
+  s->loop_count = 0;
+  s->queue_version++;
   g_mutex_unlock(&s->lock);
   emit_evt(s, SPLASH_EVT_CLEARED_QUEUE, 0, 0, NULL);
+}
+
+void splash_set_repeat_order(Splash *s, const int *indices, int n_indices){
+  if (!s) return;
+  g_mutex_lock(&s->lock);
+  if (!indices || n_indices <= 0) {
+    s->loop_count = 0;
+    s->loop_version = s->queue_version;
+    g_mutex_unlock(&s->lock);
+    return;
+  }
+  if (n_indices > MAX_QUEUE) n_indices = MAX_QUEUE;
+  gboolean valid = TRUE;
+  for (int i = 0; i < n_indices; ++i) {
+    if (indices[i] < 0 || indices[i] >= s->nseq) {
+      valid = FALSE;
+      break;
+    }
+  }
+  if (valid) {
+    s->loop_count = n_indices;
+    for (int i = 0; i < n_indices; ++i) {
+      s->loop_order[i] = indices[i];
+    }
+  } else {
+    s->loop_count = 0;
+  }
+  s->loop_version = s->queue_version;
+  g_mutex_unlock(&s->lock);
 }
 
 int splash_active_index(Splash *s){
@@ -379,6 +434,7 @@ bool splash_enqueue_next_many(Splash *s, const int *indices, int n_indices){
   for (int i = 0; i < n_indices; ++i) {
     s->pending_queue[s->pending_count++] = indices[i];
   }
+  s->queue_version++;
   int to_emit[MAX_QUEUE];
   int emit_count = n_indices;
   for (int i = 0; i < emit_count; ++i) to_emit[i] = indices[i];

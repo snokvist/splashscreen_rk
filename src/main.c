@@ -13,6 +13,7 @@ typedef struct {
   const char *name;
   int *indices;
   int count;
+  gboolean loop_at_end;
 } ComboSeq;
 
 static void free_combos(ComboSeq *combos, int count) {
@@ -30,6 +31,7 @@ typedef struct {
   ComboSeq *combos;
   int combo_count;
   gboolean started;
+  gboolean combo_loop_full;
   GMainLoop *loop;
 } AppCtx;
 
@@ -164,7 +166,10 @@ static gboolean handle_http_path(AppCtx *ctx,
         g_string_append(body, "\"");
         g_free(part_escaped);
       }
-      g_string_append(body, "]}");
+      g_string_append(body, "]");
+      g_string_append(body, ",\"loop_at_end\":");
+      g_string_append(body, ctx->combos[i].loop_at_end ? "true" : "false");
+      g_string_append(body, "}");
     }
     g_string_append(body, "]}");
     gboolean ok = send_http_response(out, 200, "OK",
@@ -183,6 +188,7 @@ static gboolean handle_http_path(AppCtx *ctx,
       int idx = splash_find_index_by_name(ctx->splash, decoded);
       if (idx >= 0) {
         if (splash_enqueue_next_by_index(ctx->splash, idx)) {
+          splash_set_repeat_order(ctx->splash, NULL, 0);
           gchar *escaped = json_escape(decoded);
           GString *body = g_string_new("{\"status\":\"queued\",\"name\":\"");
           g_string_append(body, escaped);
@@ -201,6 +207,16 @@ static gboolean handle_http_path(AppCtx *ctx,
         ComboSeq *combo = find_combo_by_name(ctx, decoded);
         if (combo && combo->count > 0) {
           if (splash_enqueue_next_many(ctx->splash, combo->indices, combo->count)) {
+            if (combo->loop_at_end) {
+              if (ctx->combo_loop_full) {
+                splash_set_repeat_order(ctx->splash, combo->indices, combo->count);
+              } else {
+                splash_set_repeat_order(ctx->splash,
+                                        &combo->indices[combo->count - 1], 1);
+              }
+            } else {
+              splash_set_repeat_order(ctx->splash, NULL, 0);
+            }
             gchar *escaped = json_escape(decoded);
             GString *body = g_string_new("{\"status\":\"queued_combo\",\"name\":\"");
             g_string_append(body, escaped);
@@ -319,7 +335,9 @@ static gboolean on_stdin_ready(GIOChannel *source, GIOCondition condition, gpoin
     } else if (ch >= '1' && ch <= '9') {
       int idx = ch - '1';
       if (idx < ctx->sequence_count) {
-        splash_enqueue_next_by_index(ctx->splash, idx);
+        if (splash_enqueue_next_by_index(ctx->splash, idx)) {
+          splash_set_repeat_order(ctx->splash, NULL, 0);
+        }
       }
     }
   }
@@ -364,8 +382,10 @@ static void usage(const char *p){
     "  end=END_FRAME\n"
     "or build combo playlists with:\n"
     "  order=seqA,seqB,...   (references previously defined sequences)\n"
+    "  loop_at_end=true|false (optional; enables full-combo repeats in 'entire' mode)\n"
     "Optionally add a [control] group with:\n"
     "  port=8081   (HTTP control port; defaults to 8081 if omitted)\n\n"
+    "  combo_loop_mode=final|entire (default=final).\n\n"
     "Options:\n"
     "  --cli           Enable interactive stdin controls (1-9 enqueue, c=clear, s=start, x=stop, q=quit).\n"
     "  --http-port=NN  Override HTTP control port (default is config [control] port or 8081).\n",
@@ -375,6 +395,7 @@ static void usage(const char *p){
 typedef struct {
   gchar *name;
   GPtrArray *parts; // array of gchar* (owned)
+  gboolean loop_at_end;
 } PendingCombo;
 
 static void pending_combo_free(PendingCombo *pc) {
@@ -475,6 +496,18 @@ static gboolean parse_combo_group(GKeyFile *kf, const gchar *group,
     return FALSE;
   }
 
+  gboolean loop_at_end = FALSE;
+  if (g_key_file_has_key(kf, group, "loop_at_end", NULL)) {
+    local_error = NULL;
+    loop_at_end = g_key_file_get_boolean(kf, group, "loop_at_end", &local_error);
+    if (local_error) {
+      g_propagate_error(error, local_error);
+      g_free(order);
+      g_free(name);
+      return FALSE;
+    }
+  }
+
   gchar **parts = g_strsplit(order, ",", -1);
   g_free(order);
   if (!parts) {
@@ -520,6 +553,7 @@ static gboolean parse_combo_group(GKeyFile *kf, const gchar *group,
   PendingCombo *combo = g_new0(PendingCombo, 1);
   combo->name = name;
   combo->parts = part_array;
+  combo->loop_at_end = loop_at_end;
   *out_combo = combo;
   return TRUE;
 }
@@ -531,17 +565,20 @@ static gboolean load_config(const char *path,
                             ComboSeq **combos_out,
                             int *n_combos_out,
                             GPtrArray **owned_strings_out,
+                            gboolean *combo_loop_full_out,
                             guint16 *http_port_out) {
   gboolean ok = FALSE;
   GError *error = NULL;
   ComboSeq *combo_array = NULL;
   guint combo_count = 0;
   GPtrArray *combo_defs = NULL;
+  gboolean combo_loop_full = FALSE;
   GKeyFile *kf = g_key_file_new();
   if (!kf) return FALSE;
 
   if (combos_out) *combos_out = NULL;
   if (n_combos_out) *n_combos_out = 0;
+  if (combo_loop_full_out) *combo_loop_full_out = FALSE;
 
   gchar *config_abs = g_canonicalize_filename(path, NULL);
   if (!config_abs) {
@@ -637,6 +674,33 @@ static gboolean load_config(const char *path,
       goto done;
     }
     control_port = (guint16)configured_port;
+  }
+
+  if (g_key_file_has_key(kf, "control", "combo_loop_mode", NULL)) {
+    error = NULL;
+    gchar *mode = g_key_file_get_string(kf, "control", "combo_loop_mode", &error);
+    if (error) {
+      fprintf(stderr, "Invalid control.combo_loop_mode: %s\n", error->message);
+      g_error_free(error);
+      goto done;
+    }
+    if (mode) {
+      if (g_ascii_strcasecmp(mode, "entire") == 0 ||
+          g_ascii_strcasecmp(mode, "full") == 0 ||
+          g_ascii_strcasecmp(mode, "all") == 0) {
+        combo_loop_full = TRUE;
+      } else if (g_ascii_strcasecmp(mode, "final") == 0 ||
+                 g_ascii_strcasecmp(mode, "last") == 0) {
+        combo_loop_full = FALSE;
+      } else {
+        fprintf(stderr,
+                "control.combo_loop_mode must be 'entire' or 'final' (got '%s')\n",
+                mode);
+        g_free(mode);
+        goto done;
+      }
+    }
+    g_free(mode);
   }
 
   GArray *seq_array = g_array_new(FALSE, FALSE, sizeof(SplashSeq));
@@ -739,6 +803,7 @@ static gboolean load_config(const char *path,
       combo_array[i].name = pc->name;
       g_ptr_array_add(owned_strings, pc->name);
       pc->name = NULL;
+      combo_array[i].loop_at_end = pc->loop_at_end;
       for (guint j = 0; j < pc->parts->len; ++j) {
         const char *part_name = g_ptr_array_index(pc->parts, j);
         int found = -1;
@@ -776,6 +841,7 @@ static gboolean load_config(const char *path,
   if (combos_out) *combos_out = combo_array;
   if (n_combos_out) *n_combos_out = (int)combo_count;
   *owned_strings_out = owned_strings;
+  if (combo_loop_full_out) *combo_loop_full_out = combo_loop_full;
   if (http_port_out) *http_port_out = control_port;
   ok = TRUE;
 
@@ -840,9 +906,10 @@ int main(int argc, char **argv){
   GPtrArray *owned_strings = NULL;
   SplashConfig cfg = {0};
   guint16 config_http_port = 8081;
+  gboolean combo_loop_full = FALSE;
   if (!load_config(config_path, &cfg, &seqs, &n_seqs,
                    &combos, &n_combos,
-                   &owned_strings, &config_http_port)) {
+                   &owned_strings, &combo_loop_full, &config_http_port)) {
     return 1;
   }
 
@@ -858,6 +925,7 @@ int main(int argc, char **argv){
   ctx.combos = combos;
   ctx.combo_count = n_combos;
   ctx.started = FALSE;
+  ctx.combo_loop_full = combo_loop_full;
   ctx.loop = g_main_loop_new(NULL, FALSE);
 
   splash_set_event_cb(S, on_evt, &ctx);
@@ -931,7 +999,8 @@ int main(int argc, char **argv){
   if (n_combos > 0) {
     fprintf(stderr, "Combo sequences (%d):\n", n_combos);
     for (int i = 0; i < n_combos; ++i) {
-      fprintf(stderr, "  - %s -> ", combos[i].name);
+      fprintf(stderr, "  - %s [loop_at_end=%s] -> ",
+              combos[i].name, combos[i].loop_at_end ? "true" : "false");
       for (int j = 0; j < combos[i].count; ++j) {
         int idx = combos[i].indices[j];
         const char *part = (idx >= 0 && idx < n_seqs) ? seqs[idx].name : "?";
