@@ -70,6 +70,41 @@ static void emit_evt(Splash *s, SplashEventType t, int a, int b, const char *m){
   if (s->evt_cb) s->evt_cb(t, a, b, m, s->evt_user);
 }
 
+
+// --- RTSP debug helpers ---
+static gboolean on_rtsp_request(GstRTSPClient *client, GstRTSPContext *ctx, gpointer user) {
+  // Log method + URL + client IP; return FALSE to continue normal handling
+  const gchar *method = ctx && ctx->request ? gst_rtsp_method_as_text(ctx->request->method) : "?";
+  const gchar *url = (ctx && ctx->uri && ctx->uri->abspath) ? ctx->uri->abspath : "?";
+  const gchar *ip = "?";
+#if GST_CHECK_VERSION(1,14,0)
+  GstRTSPConnection *conn = gst_rtsp_client_get_connection(client);
+  if (conn) ip = gst_rtsp_connection_get_ip(conn);
+#endif
+  g_printerr("[rtsp] %s %s from %s\n", method, url, ip);
+  return FALSE; // keep default handling
+}
+
+static void on_client_connected(GstRTSPServer *server, GstRTSPClient *client, gpointer user) {
+  const gchar *ip = "?";
+#if GST_CHECK_VERSION(1,14,0)
+  GstRTSPConnection *conn = gst_rtsp_client_get_connection(client);
+  if (conn) ip = gst_rtsp_connection_get_ip(conn);
+#endif
+  g_printerr("[rtsp] client-connected from %s\n", ip);
+
+  // Hook common RTSP request signals (best-effort; not all versions have all)
+  g_signal_connect(client, "options-request",  G_CALLBACK(on_rtsp_request), user);
+  g_signal_connect(client, "describe-request", G_CALLBACK(on_rtsp_request), user);
+  g_signal_connect(client, "setup-request",    G_CALLBACK(on_rtsp_request), user);
+  g_signal_connect(client, "play-request",     G_CALLBACK(on_rtsp_request), user);
+  g_signal_connect(client, "teardown-request", G_CALLBACK(on_rtsp_request), user);
+}
+
+
+
+
+
 static gboolean do_segment_seek_locked(Splash *s, int which){
   g_return_val_if_fail(s->reader!=NULL, FALSE);
   if (which < 0 || which >= s->nseq) return FALSE;
