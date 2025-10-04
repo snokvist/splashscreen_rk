@@ -7,18 +7,23 @@ CC   ?= gcc
 CFLAGS  ?= -O2 -fPIC $(shell pkg-config --cflags $(PKGS)) -Isrc
 LDFLAGS ?= $(shell pkg-config --libs $(PKGS))
 
-APP      := splash_main
-LIB      := libsplashscreen.so
-OBJDIR   := build
+APP        := splash_main
+LIB        := libsplashscreen.so
+OBJDIR     := build
+
+ASSET_ZIP := spinner_ai_1080p30.zip
+ASSET_OUT := $(ASSET_ZIP:.zip=.h265)
 
 # Objects
 LIB_OBJS := $(OBJDIR)/splashlib.o
 
 # --- Phony targets ---
-.PHONY: all clean static run-udp
+.PHONY: all assets clean static run-udp
 
 # Default: shared lib + app linked against it
-all: $(LIB) $(APP)
+all: assets $(LIB) $(APP)
+
+assets: $(ASSET_OUT)
 
 # Shared library
 $(LIB): $(LIB_OBJS)
@@ -39,10 +44,14 @@ $(OBJDIR)/%.o: src/%.c src/%.h | $(OBJDIR)
 $(OBJDIR):
 	@mkdir -p $(OBJDIR)
 
+$(ASSET_OUT): $(ASSET_ZIP)
+	@echo "Unpacking $<"
+	gunzip -c $< > $@
+
 # Convenience run targets (adjust args as needed)
 run-udp: $(APP)
 	./$(APP) config/demo.ini
 
 # Cleanup
 clean:
-	rm -rf $(OBJDIR) $(APP) $(LIB)
+	rm -rf $(OBJDIR) $(APP) $(LIB) $(ASSET_OUT)

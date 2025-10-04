@@ -7,7 +7,8 @@ predefined combo playlists.
 
 ## Requirements
 
-Install the development toolchain and GStreamer components before building:
+Install the development toolchain, GStreamer components, and GNU gzip before
+building so the asset extraction rule can unpack the bundled demo stream:
 
 ```sh
 sudo apt-get update
@@ -15,14 +16,17 @@ sudo apt-get install -y \
   build-essential pkg-config \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libgstrtspserver-1.0-dev \
-  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  gzip
 ```
 
 ## Building
 
 Once the dependencies are present, build the project with `make`. The default
 rule compiles the CLI and HTTP control application as well as the supporting
-`splashlib` GStreamer wrapper.
+`splashlib` GStreamer wrapper. The build also unpacks the demo
+`spinner_ai_1080p30.h265` stream from the checked-in ZIP archive so the sample
+configuration can run immediately.
 
 ## Configuration
 
