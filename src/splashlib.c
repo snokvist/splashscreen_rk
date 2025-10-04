@@ -174,8 +174,10 @@ static void on_media_configure(GstRTSPMediaFactory *factory, GstRTSPMedia *media
   s->appsrc_rtsp = gst_bin_get_by_name(GST_BIN(bin), "src");
   g_object_set(s->appsrc_rtsp, "is-live", TRUE, "format", GST_FORMAT_TIME,
                "block", TRUE, "do-timestamp", FALSE, NULL);
+  g_printerr("[rtsp] media-configure: appsrc ready\n");
   gst_object_unref(bin);
 }
+
 
 // ---- pipelines ----
 static void destroy_pipelines_locked(Splash *s){
@@ -234,6 +236,13 @@ static gboolean build_pipelines_locked(Splash *s, GError **err){
     gst_rtsp_mount_points_add_factory(mounts, s->path ? s->path : "/splash", s->rtsp_factory);
     g_object_unref(mounts);
     gst_rtsp_server_attach(s->rtsp_server, NULL);
+    // --- NEW: log listening URL + connect client-connected
+    g_signal_connect(s->rtsp_server, "client-connected", G_CALLBACK(on_client_connected), s);
+    g_printerr("[rtsp] listening on rtsp://%s:%d%s (UDP only)\n",
+               s->host ? s->host : "0.0.0.0",
+               s->port,
+               s->path ? s->path : "/splash");
+    
   }
   return TRUE;
 }
