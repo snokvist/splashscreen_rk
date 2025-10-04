@@ -67,6 +67,10 @@ bool splash_enqueue_next_by_name(Splash *s, const char *name);
 bool splash_enqueue_next_many(Splash *s, const int *indices, int n_indices);
 void splash_clear_next(Splash *s);
 
+// Configure automatic looping order once the queue drains. Passing NULL or
+// n_indices<=0 disables any custom repeat behavior.
+void splash_set_repeat_order(Splash *s, const int *indices, int n_indices);
+
 // Query helpers (optional)
 int  splash_active_index(Splash *s);          // -1 if none
 int  splash_pending_index(Splash *s);         // -1 if none
