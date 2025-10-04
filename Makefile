@@ -41,7 +41,7 @@ $(OBJDIR):
 
 # Convenience run targets (adjust args as needed)
 run-udp: $(APP)
-	./$(APP) spinner_1080p30.h265 30 --udp 127.0.0.1 5600
+	./$(APP) config/demo.ini
 
 # Cleanup
 clean:
