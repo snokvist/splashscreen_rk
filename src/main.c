@@ -1,11 +1,21 @@
 #include "splashlib.h"
-#include <stdio.h>
-#include <unistd.h>
-#include <termios.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <string.h>
-#include <stdlib.h>
+#include <gio/gio.h>
 #include <glib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <termios.h>
+#include <unistd.h>
+
+typedef struct {
+  Splash *splash;
+  SplashSeq *sequences;
+  int sequence_count;
+  gboolean started;
+  GMainLoop *loop;
+} AppCtx;
 
 static gboolean set_stdin_nonblock(void) {
   struct termios t; if (tcgetattr(STDIN_FILENO, &t)) return FALSE;
@@ -15,11 +25,243 @@ static gboolean set_stdin_nonblock(void) {
   return fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
+static gchar *json_escape(const char *in) {
+  if (!in) return g_strdup("");
+  GString *out = g_string_new(NULL);
+  for (const unsigned char *p = (const unsigned char*)in; *p; ++p) {
+    switch (*p) {
+      case '\\': g_string_append(out, "\\\\"); break;
+      case '\"': g_string_append(out, "\\\""); break;
+      case '\b': g_string_append(out, "\\b"); break;
+      case '\f': g_string_append(out, "\\f"); break;
+      case '\n': g_string_append(out, "\\n"); break;
+      case '\r': g_string_append(out, "\\r"); break;
+      case '\t': g_string_append(out, "\\t"); break;
+      default:
+        if (*p < 0x20) {
+          g_string_append_printf(out, "\\u%04x", *p);
+        } else {
+          g_string_append_c(out, (char)*p);
+        }
+    }
+  }
+  return g_string_free(out, FALSE);
+}
+
+static gboolean send_http_response(GOutputStream *out,
+                                   int status,
+                                   const char *reason,
+                                   const char *content_type,
+                                   const char *body) {
+  if (!content_type) content_type = "text/plain";
+  if (!body) body = "";
+  gsize body_len = strlen(body);
+  GString *resp = g_string_new(NULL);
+  g_string_append_printf(resp, "HTTP/1.1 %d %s\r\n", status, reason);
+  g_string_append_printf(resp, "Content-Type: %s\r\n", content_type);
+  g_string_append_printf(resp, "Content-Length: %" G_GSIZE_FORMAT "\r\n", body_len);
+  g_string_append(resp, "Connection: close\r\n\r\n");
+  g_string_append_len(resp, body, body_len);
+  gsize written = 0;
+  GError *error = NULL;
+  gboolean ok = g_output_stream_write_all(out, resp->str, resp->len,
+                                          &written, NULL, &error);
+  if (!ok && error) {
+    fprintf(stderr, "HTTP response write failed: %s\n", error->message);
+    g_error_free(error);
+  }
+  g_string_free(resp, TRUE);
+  return ok;
+}
+
+static gboolean handle_http_path(AppCtx *ctx,
+                                 const char *path,
+                                 GOutputStream *out) {
+  if (!g_strcmp0(path, "/request/start")) {
+    if (ctx->started) {
+      return send_http_response(out, 200, "OK",
+                                "application/json",
+                                "{\"status\":\"already_running\"}");
+    }
+    if (!splash_start(ctx->splash)) {
+      return send_http_response(out, 500, "Internal Server Error",
+                                "application/json",
+                                "{\"status\":\"error\",\"message\":\"failed_to_start\"}");
+    }
+    ctx->started = TRUE;
+    return send_http_response(out, 200, "OK",
+                              "application/json",
+                              "{\"status\":\"started\"}");
+  }
+
+  if (!g_strcmp0(path, "/request/stop")) {
+    if (!ctx->started) {
+      return send_http_response(out, 200, "OK",
+                                "application/json",
+                                "{\"status\":\"already_stopped\"}");
+    }
+    splash_stop(ctx->splash);
+    ctx->started = FALSE;
+    return send_http_response(out, 200, "OK",
+                              "application/json",
+                              "{\"status\":\"stopped\"}");
+  }
+
+  if (!g_strcmp0(path, "/request/list")) {
+    GString *body = g_string_new("{\"sequences\":[");
+    for (int i = 0; i < ctx->sequence_count; ++i) {
+      if (i > 0) g_string_append(body, ",");
+      gchar *escaped = json_escape(ctx->sequences[i].name);
+      g_string_append(body, "\"");
+      g_string_append(body, escaped);
+      g_string_append(body, "\"");
+      g_free(escaped);
+    }
+    g_string_append(body, "]}");
+    gboolean ok = send_http_response(out, 200, "OK",
+                                     "application/json",
+                                     body->str);
+    g_string_free(body, TRUE);
+    return ok;
+  }
+
+  const char *enqueue_prefix = "/request/enqueue/";
+  if (g_str_has_prefix(path, enqueue_prefix)) {
+    const char *raw_name = path + strlen(enqueue_prefix);
+    gchar *decoded = g_uri_unescape_string(raw_name, NULL);
+    gboolean ok = FALSE;
+    if (decoded && decoded[0] != '\0') {
+      if (splash_enqueue_next_by_name(ctx->splash, decoded)) {
+        gchar *escaped = json_escape(decoded);
+        GString *body = g_string_new("{\"status\":\"queued\",\"name\":\"");
+        g_string_append(body, escaped);
+        g_string_append(body, "\"}");
+        ok = send_http_response(out, 200, "OK",
+                                "application/json",
+                                body->str);
+        g_string_free(body, TRUE);
+        g_free(escaped);
+      } else {
+        gchar *escaped = json_escape(decoded);
+        GString *body = g_string_new("{\"status\":\"not_found\",\"name\":\"");
+        g_string_append(body, escaped);
+        g_string_append(body, "\"}");
+        ok = send_http_response(out, 404, "Not Found",
+                                "application/json",
+                                body->str);
+        g_string_free(body, TRUE);
+        g_free(escaped);
+      }
+    } else {
+      ok = send_http_response(out, 400, "Bad Request",
+                              "application/json",
+                              "{\"status\":\"invalid_name\"}");
+    }
+    g_free(decoded);
+    return ok;
+  }
+
+  return send_http_response(out, 404, "Not Found",
+                            "application/json",
+                            "{\"status\":\"unknown_request\"}");
+}
+
+static gboolean on_http_client(GSocketService *service,
+                               GSocketConnection *connection,
+                               GObject *source_object,
+                               gpointer user_data) {
+  (void)service;
+  (void)source_object;
+  AppCtx *ctx = (AppCtx *)user_data;
+  GInputStream *in = g_io_stream_get_input_stream(G_IO_STREAM(connection));
+  GOutputStream *out = g_io_stream_get_output_stream(G_IO_STREAM(connection));
+  char buffer[2048];
+  GError *error = NULL;
+  gssize n = g_input_stream_read(in, buffer, sizeof(buffer) - 1, NULL, &error);
+  if (n <= 0) {
+    if (error) {
+      fprintf(stderr, "HTTP read failed: %s\n", error->message);
+      g_error_free(error);
+    }
+    g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+    return TRUE;
+  }
+  buffer[n] = '\0';
+
+  char method[16] = {0};
+  char path[1024] = {0};
+  if (sscanf(buffer, "%15s %1023s", method, path) != 2) {
+    send_http_response(out, 400, "Bad Request",
+                       "application/json",
+                       "{\"status\":\"bad_request\"}");
+    g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+    return TRUE;
+  }
+
+  if (g_strcmp0(method, "GET") != 0) {
+    send_http_response(out, 405, "Method Not Allowed",
+                       "application/json",
+                       "{\"status\":\"method_not_allowed\"}");
+    g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+    return TRUE;
+  }
+
+  char *query = strchr(path, '?');
+  if (query) *query = '\0';
+
+  handle_http_path(ctx, path, out);
+  g_io_stream_close(G_IO_STREAM(connection), NULL, NULL);
+  return TRUE;
+}
+
+static gboolean on_stdin_ready(GIOChannel *source, GIOCondition condition, gpointer user_data) {
+  (void)source;
+  (void)condition;
+  AppCtx *ctx = (AppCtx *)user_data;
+  for (;;) {
+    char ch;
+    ssize_t r = read(STDIN_FILENO, &ch, 1);
+    if (r == 0) break;
+    if (r < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+      perror("read");
+      break;
+    }
+    if (ch == 'q') {
+      if (ctx->loop) g_main_loop_quit(ctx->loop);
+      break;
+    } else if (ch == 'c') {
+      splash_clear_next(ctx->splash);
+    } else if (ch == 's') {
+      if (!ctx->started && splash_start(ctx->splash)) {
+        ctx->started = TRUE;
+      }
+    } else if (ch == 'x') {
+      if (ctx->started) {
+        splash_stop(ctx->splash);
+        ctx->started = FALSE;
+      }
+    } else if (ch >= '1' && ch <= '9') {
+      int idx = ch - '1';
+      if (idx < ctx->sequence_count) {
+        splash_enqueue_next_by_index(ctx->splash, idx);
+      }
+    }
+  }
+  return G_SOURCE_CONTINUE;
+}
+
 static void on_evt(SplashEventType type, int a, int b, const char *msg, void *user){
-  (void)user;
+  AppCtx *ctx = (AppCtx*)user;
   switch(type){
-    case SPLASH_EVT_STARTED: fprintf(stderr, "[evt] started\n"); break;
-    case SPLASH_EVT_STOPPED: fprintf(stderr, "[evt] stopped\n"); break;
+    case SPLASH_EVT_STARTED:
+      if (ctx) ctx->started = TRUE;
+      fprintf(stderr, "[evt] started\n");
+      break;
+    case SPLASH_EVT_STOPPED:
+      if (ctx) ctx->started = FALSE;
+      fprintf(stderr, "[evt] stopped\n");
+      break;
     case SPLASH_EVT_SWITCHED_AT_BOUNDARY:
       fprintf(stderr, "[evt] switched at boundary: %d -> %d\n", a, b); break;
     case SPLASH_EVT_QUEUED_NEXT:
@@ -36,13 +278,18 @@ static void on_evt(SplashEventType type, int a, int b, const char *msg, void *us
 static void usage(const char *p){
   fprintf(stderr,
     "Usage:\n"
-    "  %s <config.ini>\n\n"
+    "  %s [--cli] [--http-port=PORT] <config.ini>\n\n"
     "The configuration file must contain a [stream] group with keys:\n"
     "  input=/path/to/file.h265\n"
     "  fps=30.0\n"
     "  host=127.0.0.1\n"
     "  port=5600\n"
-    "and one or more [sequence NAME] groups defining start/end frames.\n",
+    "and one or more [sequence NAME] groups defining start/end frames.\n"
+    "Optionally add a [control] group with:\n"
+    "  port=8081   (HTTP control port; defaults to 8081 if omitted)\n\n"
+    "Options:\n"
+    "  --cli           Enable interactive stdin controls (1-9 enqueue, c=clear, s=start, x=stop, q=quit).\n"
+    "  --http-port=NN  Override HTTP control port (default is config [control] port or 8081).\n",
     p);
 }
 
@@ -104,7 +351,8 @@ static gboolean load_config(const char *path,
                             SplashConfig *cfg,
                             SplashSeq **seqs_out,
                             int *n_seqs_out,
-                            GPtrArray **owned_strings_out) {
+                            GPtrArray **owned_strings_out,
+                            guint16 *http_port_out) {
   gboolean ok = FALSE;
   GError *error = NULL;
   GKeyFile *kf = g_key_file_new();
@@ -190,6 +438,22 @@ static gboolean load_config(const char *path,
     goto done;
   }
 
+  guint16 control_port = 8081;
+  if (g_key_file_has_key(kf, "control", "port", NULL)) {
+    error = NULL;
+    gint configured_port = g_key_file_get_integer(kf, "control", "port", &error);
+    if (error) {
+      fprintf(stderr, "Invalid control.port: %s\n", error->message);
+      g_error_free(error);
+      goto done;
+    }
+    if (configured_port < 1 || configured_port > 65535) {
+      fprintf(stderr, "control.port must be between 1 and 65535 (got %d)\n", configured_port);
+      goto done;
+    }
+    control_port = (guint16)configured_port;
+  }
+
   GArray *seq_array = g_array_new(FALSE, FALSE, sizeof(SplashSeq));
   if (!seq_array) goto done;
 
@@ -231,6 +495,7 @@ static gboolean load_config(const char *path,
   *seqs_out = seqs;
   *n_seqs_out = (int)seq_count;
   *owned_strings_out = owned_strings;
+  if (http_port_out) *http_port_out = control_port;
   ok = TRUE;
 
 done:
@@ -244,23 +509,64 @@ done:
 }
 
 int main(int argc, char **argv){
-  if (argc != 2) { usage(argv[0]); return 2; }
+  gboolean cli_mode = FALSE;
+  gboolean port_overridden = FALSE;
+  guint16 http_port = 0;
+  const char *config_path = NULL;
 
-  const char *config_path = argv[1];
+  for (int i = 1; i < argc; ++i) {
+    if (!strcmp(argv[i], "--cli")) {
+      cli_mode = TRUE;
+    } else if (g_str_has_prefix(argv[i], "--http-port=")) {
+      const char *num = argv[i] + strlen("--http-port=");
+      gchar *endptr = NULL;
+      long port_val = strtol(num, &endptr, 10);
+      if (!num[0] || (endptr && *endptr) || port_val < 1 || port_val > 65535) {
+        fprintf(stderr, "Invalid --http-port value: %s\n", num);
+        usage(argv[0]);
+        return 2;
+      }
+      http_port = (guint16)port_val;
+      port_overridden = TRUE;
+    } else if (argv[i][0] == '-') {
+      usage(argv[0]);
+      return 2;
+    } else if (!config_path) {
+      config_path = argv[i];
+    } else {
+      usage(argv[0]);
+      return 2;
+    }
+  }
+
+  if (!config_path) { usage(argv[0]); return 2; }
 
   SplashSeq *seqs = NULL;
   int n_seqs = 0;
   GPtrArray *owned_strings = NULL;
   SplashConfig cfg = {0};
-  if (!load_config(config_path, &cfg, &seqs, &n_seqs, &owned_strings)) {
+  guint16 config_http_port = 8081;
+  if (!load_config(config_path, &cfg, &seqs, &n_seqs, &owned_strings, &config_http_port)) {
     return 1;
   }
 
+  if (!port_overridden) {
+    http_port = config_http_port;
+  }
+
   Splash *S = splash_new();
-  splash_set_event_cb(S, on_evt, NULL);
+  AppCtx ctx = {0};
+  ctx.splash = S;
+  ctx.sequences = seqs;
+  ctx.sequence_count = n_seqs;
+  ctx.started = FALSE;
+  ctx.loop = g_main_loop_new(NULL, FALSE);
+
+  splash_set_event_cb(S, on_evt, &ctx);
 
   if (!splash_set_sequences(S, seqs, n_seqs)) {
     fprintf(stderr, "Failed to configure sequences\n");
+    if (ctx.loop) g_main_loop_unref(ctx.loop);
     splash_free(S);
     g_free(seqs);
     g_ptr_array_free(owned_strings, TRUE);
@@ -269,6 +575,7 @@ int main(int argc, char **argv){
 
   if (!splash_apply_config(S, &cfg)) {
     fprintf(stderr, "Failed to apply config\n");
+    if (ctx.loop) g_main_loop_unref(ctx.loop);
     splash_free(S);
     g_free(seqs);
     g_ptr_array_free(owned_strings, TRUE);
@@ -276,7 +583,40 @@ int main(int argc, char **argv){
   }
   if (!splash_start(S)) {
     fprintf(stderr, "Failed to start\n");
+    if (ctx.loop) g_main_loop_unref(ctx.loop);
+    splash_free(S);
+    g_free(seqs);
+    g_ptr_array_free(owned_strings, TRUE);
     return 1;
+  }
+  ctx.started = TRUE;
+
+  GSocketService *http_service = g_socket_service_new();
+  g_signal_connect(http_service, "incoming", G_CALLBACK(on_http_client), &ctx);
+  gboolean http_ok = FALSE;
+  GError *http_error = NULL;
+  guint16 bind_port = http_port;
+  if (bind_port == 0) {
+    bind_port = config_http_port;
+  }
+
+  if (g_socket_listener_add_inet_port(G_SOCKET_LISTENER(http_service), bind_port,
+                                      NULL, &http_error)) {
+    http_ok = TRUE;
+  } else {
+    fprintf(stderr, "Failed to bind HTTP port %u: %s\n", bind_port,
+            http_error ? http_error->message : "unknown error");
+    if (http_error) g_error_free(http_error);
+  }
+  if (http_ok) {
+    g_socket_service_start(http_service);
+    fprintf(stderr,
+            "HTTP control listening on http://127.0.0.1:%u/request/{start,stop,enqueue/<name>,list}\n",
+            bind_port);
+  } else {
+    fprintf(stderr, "HTTP control disabled (no available port).\n");
+    g_object_unref(http_service);
+    http_service = NULL;
   }
 
   fprintf(stderr, "Configured sequences (%d):\n", n_seqs);
@@ -287,30 +627,38 @@ int main(int argc, char **argv){
   if (n_seqs > 9) {
     fprintf(stderr, "Additional sequences are available via API calls only.\n");
   }
-  fprintf(stderr, "Running. Press 1-%d to enqueue; c=clear; q=quit\n",
-          n_seqs < 9 ? n_seqs : 9);
-  set_stdin_nonblock();
+  if (cli_mode) {
+    fprintf(stderr,
+            "Interactive CLI enabled. Press 1-%d to enqueue; c=clear; s=start; x=stop; q=quit\n",
+            n_seqs < 9 ? n_seqs : 9);
+  }
 
-  // Key loop
-  for (;;) {
-    char ch;
-    if (read(STDIN_FILENO, &ch, 1)==1){
-      if (ch=='q') { splash_quit(S); break; }
-      else if (ch=='c') { splash_clear_next(S); }
-      else if (ch>='1' && ch<='9') {
-        int idx = ch - '1';
-        if (idx < n_seqs) {
-          splash_enqueue_next_by_index(S, idx);
-        }
-      }
+  GIOChannel *stdin_chan = NULL;
+  guint stdin_watch_id = 0;
+  if (cli_mode) {
+    if (!set_stdin_nonblock()) {
+      fprintf(stderr, "Failed to configure stdin for non-blocking mode.\n");
     } else {
-      // let GLib do the heavy lifting
-      while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
-      g_usleep(1000*5);
+      stdin_chan = g_io_channel_unix_new(STDIN_FILENO);
+      g_io_channel_set_encoding(stdin_chan, NULL, NULL);
+      g_io_channel_set_buffered(stdin_chan, FALSE);
+      stdin_watch_id = g_io_add_watch(stdin_chan, G_IO_IN, on_stdin_ready, &ctx);
     }
   }
 
-  splash_stop(S);
+  if (ctx.loop) {
+    g_main_loop_run(ctx.loop);
+  }
+
+  if (stdin_watch_id) g_source_remove(stdin_watch_id);
+  if (stdin_chan) g_io_channel_unref(stdin_chan);
+
+  if (ctx.started) splash_stop(S);
+  if (http_service) {
+    g_socket_service_stop(http_service);
+    g_object_unref(http_service);
+  }
+  if (ctx.loop) g_main_loop_unref(ctx.loop);
   splash_free(S);
   g_free(seqs);
   g_ptr_array_free(owned_strings, TRUE);

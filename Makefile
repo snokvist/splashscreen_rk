@@ -1,7 +1,7 @@
 # Makefile (outputs in current dir; sources in ./src)
 
 # --- Config ---
-PKGS := gstreamer-1.0 gstreamer-app-1.0
+PKGS := gstreamer-1.0 gstreamer-app-1.0 gio-2.0
 CC   ?= gcc
 
 CFLAGS  ?= -O2 -fPIC $(shell pkg-config --cflags $(PKGS)) -Isrc
