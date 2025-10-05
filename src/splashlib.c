@@ -24,6 +24,7 @@ struct Splash {
   char *input_path;
   double fps;
   GstClockTime dur;
+  SplashOutputMode outputs;
   char *host;
   int   port;
 
@@ -38,6 +39,9 @@ struct Splash {
   // Sender (UDP)
   GstElement *sender_udp;
   GstElement *appsrc_udp;
+
+  // Direct appsrc output
+  GstElement *appsrc_out;
 
   // Timing
   GstClockTime next_pts;
@@ -127,25 +131,48 @@ static gboolean on_reader_bus(GstBus *bus, GstMessage *m, gpointer user) {
 
 static GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user) {
   Splash *s = (Splash*)user;
-  GstElement *as = s->appsrc_udp;
-  if (!as) return GST_FLOW_OK;
-
   GstSample *samp = gst_app_sink_pull_sample(sink);
   if (!samp) return GST_FLOW_EOS;
   GstBuffer *inbuf = gst_sample_get_buffer(samp);
+  if (!inbuf) {
+    gst_sample_unref(samp);
+    return GST_FLOW_ERROR;
+  }
 
-  GstBuffer *out = gst_buffer_copy_deep(inbuf);
-
+  GstClockTime pts;
+  GstClockTime dur;
   g_mutex_lock(&s->lock);
-  GST_BUFFER_PTS(out)      = s->next_pts;
-  GST_BUFFER_DTS(out)      = GST_CLOCK_TIME_NONE;
-  GST_BUFFER_DURATION(out) = s->dur;
-  s->next_pts += s->dur;
+  pts = s->next_pts;
+  dur = s->dur;
+  s->next_pts += dur;
   g_mutex_unlock(&s->lock);
 
-  GstFlowReturn fr = gst_app_src_push_buffer(GST_APP_SRC(as), out);
+  GstFlowReturn overall = GST_FLOW_OK;
+  gboolean pushed = FALSE;
+
+  if ((s->outputs & SPLASH_OUTPUT_UDP) && s->appsrc_udp) {
+    GstBuffer *out = gst_buffer_copy_deep(inbuf);
+    GST_BUFFER_PTS(out)      = pts;
+    GST_BUFFER_DTS(out)      = GST_CLOCK_TIME_NONE;
+    GST_BUFFER_DURATION(out) = dur;
+    GstFlowReturn fr = gst_app_src_push_buffer(GST_APP_SRC(s->appsrc_udp), out);
+    overall = fr;
+    pushed = TRUE;
+  }
+
+  if ((s->outputs & SPLASH_OUTPUT_APPSRC) && s->appsrc_out) {
+    GstBuffer *out = gst_buffer_copy_deep(inbuf);
+    GST_BUFFER_PTS(out)      = pts;
+    GST_BUFFER_DTS(out)      = GST_CLOCK_TIME_NONE;
+    GST_BUFFER_DURATION(out) = dur;
+    GstFlowReturn fr = gst_app_src_push_buffer(GST_APP_SRC(s->appsrc_out), out);
+    if (!pushed || overall == GST_FLOW_OK) overall = fr;
+    pushed = TRUE;
+  }
+
   gst_sample_unref(samp);
-  return fr;
+  if (!pushed) return GST_FLOW_OK;
+  return overall;
 }
 
 // ------------------------------------------------------------------
@@ -168,6 +195,11 @@ static void destroy_pipelines_locked(Splash *s){
     s->sender_udp=NULL;
   }
   s->appsrc_udp = NULL;
+
+  if (s->appsrc_out) {
+    gst_object_unref(s->appsrc_out);
+    s->appsrc_out = NULL;
+  }
 }
 
 static gboolean build_pipelines_locked(Splash *s, GError **err){
@@ -187,16 +219,48 @@ static gboolean build_pipelines_locked(Splash *s, GError **err){
   gst_bus_add_watch(rbus, (GstBusFunc)on_reader_bus, s);
   gst_object_unref(rbus);
 
-  // UDP RTP sender
-  gchar *sdesc = g_strdup_printf(
-    "appsrc name=src is-live=true format=time do-timestamp=false block=true "
-      "caps=video/x-h265,stream-format=byte-stream,alignment=au,framerate=%d/1 ! "
-    "h265parse config-interval=1 ! rtph265pay pt=97 mtu=1200 config-interval=1 ! "
-    "udpsink host=%s port=%d sync=true async=false",
-    (int)(s->fps+0.5), s->host, s->port);
-  s->sender_udp = gst_parse_launch(sdesc, err); g_free(sdesc);
-  if (!s->sender_udp) return FALSE;
-  s->appsrc_udp = gst_bin_get_by_name(GST_BIN(s->sender_udp), "src");
+  if (s->outputs & SPLASH_OUTPUT_UDP) {
+    gchar *sdesc = g_strdup_printf(
+      "appsrc name=src is-live=true format=time do-timestamp=false block=true "
+        "caps=video/x-h265,stream-format=byte-stream,alignment=au,framerate=%d/1 ! "
+      "h265parse config-interval=1 ! rtph265pay pt=97 mtu=1200 config-interval=1 ! "
+      "udpsink host=%s port=%d sync=true async=false",
+      (int)(s->fps+0.5), s->host, s->port);
+    s->sender_udp = gst_parse_launch(sdesc, err); g_free(sdesc);
+    if (!s->sender_udp) return FALSE;
+    s->appsrc_udp = gst_bin_get_by_name(GST_BIN(s->sender_udp), "src");
+  } else {
+    s->sender_udp = NULL;
+    s->appsrc_udp = NULL;
+  }
+
+  if (s->outputs & SPLASH_OUTPUT_APPSRC) {
+    s->appsrc_out = gst_element_factory_make("appsrc", "splash_out_appsrc");
+    if (!s->appsrc_out) {
+      if (err) {
+        g_set_error(err, GST_CORE_ERROR, GST_CORE_ERROR_FAILED,
+                    "failed to create appsrc output element");
+      }
+      destroy_pipelines_locked(s);
+      return FALSE;
+    }
+    GstCaps *caps = gst_caps_new_simple("video/x-h265",
+      "stream-format", G_TYPE_STRING, "byte-stream",
+      "alignment", G_TYPE_STRING, "au",
+      "framerate", GST_TYPE_FRACTION, (int)(s->fps+0.5), 1,
+      NULL);
+    g_object_set(G_OBJECT(s->appsrc_out),
+      "is-live", TRUE,
+      "format", GST_FORMAT_TIME,
+      "do-timestamp", FALSE,
+      "block", TRUE,
+      "caps", caps,
+      NULL);
+    gst_caps_unref(caps);
+  } else {
+    s->appsrc_out = NULL;
+  }
+
   return TRUE;
 }
 
@@ -215,6 +279,7 @@ Splash* splash_new(void){
   s->loop = g_main_loop_new(NULL, FALSE);
   s->fps = 30.0;
   s->dur = (GstClockTime)(GST_SECOND/30.0 + 0.5);
+  s->outputs = SPLASH_OUTPUT_UDP;
   s->host = g_strdup("127.0.0.1");
   s->port = 5600;
   s->active_idx = -1;
@@ -291,8 +356,24 @@ bool splash_apply_config(Splash *s, const SplashConfig *cfg){
   dup_cstr(&s->input_path, cfg->input_path);
   s->fps = cfg->fps;
   s->dur = (GstClockTime)(GST_SECOND / s->fps + 0.5);
-  dup_cstr(&s->host, cfg->endpoint.host ? cfg->endpoint.host : "127.0.0.1");
-  s->port = cfg->endpoint.port;
+  SplashOutputMode outputs = cfg->outputs;
+  if ((outputs & ~(SPLASH_OUTPUT_UDP | SPLASH_OUTPUT_APPSRC)) != 0) {
+    g_mutex_unlock(&s->lock);
+    return false;
+  }
+  if (outputs == SPLASH_OUTPUT_NONE) outputs = SPLASH_OUTPUT_UDP;
+  if ((outputs & SPLASH_OUTPUT_UDP) && (!cfg->endpoint.host || cfg->endpoint.port <= 0)) {
+    g_mutex_unlock(&s->lock);
+    return false;
+  }
+  s->outputs = outputs;
+  if (outputs & SPLASH_OUTPUT_UDP) {
+    dup_cstr(&s->host, cfg->endpoint.host ? cfg->endpoint.host : "127.0.0.1");
+    s->port = cfg->endpoint.port;
+  } else {
+    free_str(&s->host);
+    s->port = 0;
+  }
 
   // recompute sequence segment times (fps may have changed)
   for (int i=0;i<s->nseq;i++){
@@ -472,4 +553,13 @@ int splash_find_index_by_name(Splash *s, const char *name){
   }
   g_mutex_unlock(&s->lock);
   return idx;
+}
+
+GstElement* splash_get_appsrc(Splash *s){
+  if (!s) return NULL;
+  g_mutex_lock(&s->lock);
+  GstElement *out = (s->outputs & SPLASH_OUTPUT_APPSRC) ? s->appsrc_out : NULL;
+  if (out) gst_object_ref(out);
+  g_mutex_unlock(&s->lock);
+  return out;
 }

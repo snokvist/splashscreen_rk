@@ -18,6 +18,13 @@ typedef struct {
   int end_frame;      // e.g., 180
 } SplashSeq;
 
+// Output selection
+typedef enum {
+  SPLASH_OUTPUT_NONE   = 0,
+  SPLASH_OUTPUT_UDP    = 1 << 0,
+  SPLASH_OUTPUT_APPSRC = 1 << 1,
+} SplashOutputMode;
+
 // UDP endpoint
 typedef struct {
   const char *host;  // e.g., "127.0.0.1"
@@ -28,6 +35,7 @@ typedef struct {
 typedef struct {
   const char *input_path;   // Annex-B H.265 elementary stream (AUD+VUI recommended)
   double fps;               // e.g., 30.0
+  SplashOutputMode outputs; // Bitmask of SPLASH_OUTPUT_* values (defaults to UDP)
   SplashEndpoint endpoint;  // UDP host+port
 } SplashConfig;
 
@@ -96,6 +104,9 @@ int  splash_find_index_by_name(Splash *s, const char *name);
 
 // Logging / events
 void splash_set_event_cb(Splash *s, SplashEventCb cb, void *user);
+
+// Accessors for optional outputs
+GstElement* splash_get_appsrc(Splash *s); // returns new ref or NULL when disabled
 
 #ifdef __cplusplus
 }
