@@ -66,6 +66,38 @@ static gchar *json_escape(const char *in) {
   return g_string_free(out, FALSE);
 }
 
+static gboolean parse_stream_outputs(const char *value, SplashOutputMode *mode_out) {
+  if (!mode_out) return FALSE;
+  SplashOutputMode mode = SPLASH_OUTPUT_NONE;
+  if (!value || !*value) {
+    *mode_out = SPLASH_OUTPUT_UDP;
+    return TRUE;
+  }
+  gchar **tokens = g_strsplit(value, ",", -1);
+  if (!tokens) {
+    *mode_out = SPLASH_OUTPUT_UDP;
+    return TRUE;
+  }
+  for (gint i = 0; tokens[i]; ++i) {
+    gchar *trimmed = g_strstrip(tokens[i]);
+    if (!trimmed || *trimmed == '\0') continue;
+    if (g_ascii_strcasecmp(trimmed, "udp") == 0) {
+      mode |= SPLASH_OUTPUT_UDP;
+    } else if (g_ascii_strcasecmp(trimmed, "appsrc") == 0) {
+      mode |= SPLASH_OUTPUT_APPSRC;
+    } else if (g_ascii_strcasecmp(trimmed, "both") == 0) {
+      mode |= (SplashOutputMode)(SPLASH_OUTPUT_UDP | SPLASH_OUTPUT_APPSRC);
+    } else {
+      g_strfreev(tokens);
+      return FALSE;
+    }
+  }
+  g_strfreev(tokens);
+  if (mode == SPLASH_OUTPUT_NONE) mode = SPLASH_OUTPUT_UDP;
+  *mode_out = mode;
+  return TRUE;
+}
+
 static ComboSeq *find_combo_by_name(AppCtx *ctx, const char *name) {
   if (!ctx || !name) return NULL;
   for (int i = 0; i < ctx->combo_count; ++i) {
@@ -642,22 +674,44 @@ static gboolean load_config(const char *path,
     goto done;
   }
 
-  error = NULL;
-  gchar *host = g_key_file_get_string(kf, "stream", "host", &error);
-  if (error) {
-    fprintf(stderr, "Config missing stream.host: %s\n", error->message);
-    g_error_free(error);
-    goto done;
+  cfg->outputs = SPLASH_OUTPUT_UDP;
+  if (g_key_file_has_key(kf, "stream", "outputs", NULL)) {
+    error = NULL;
+    gchar *outputs = g_key_file_get_string(kf, "stream", "outputs", &error);
+    if (error) {
+      fprintf(stderr, "Invalid stream.outputs: %s\n", error->message);
+      g_error_free(error);
+      goto done;
+    }
+    if (!parse_stream_outputs(outputs, &cfg->outputs)) {
+      fprintf(stderr, "stream.outputs must contain only 'udp' and/or 'appsrc'\n");
+      g_free(outputs);
+      goto done;
+    }
+    g_free(outputs);
   }
-  g_ptr_array_add(owned_strings, host);
-  cfg->endpoint.host = host;
 
-  error = NULL;
-  cfg->endpoint.port = g_key_file_get_integer(kf, "stream", "port", &error);
-  if (error) {
-    fprintf(stderr, "Config missing/invalid stream.port: %s\n", error->message);
-    g_error_free(error);
-    goto done;
+  if (cfg->outputs & SPLASH_OUTPUT_UDP) {
+    error = NULL;
+    gchar *host = g_key_file_get_string(kf, "stream", "host", &error);
+    if (error) {
+      fprintf(stderr, "Config missing stream.host: %s\n", error->message);
+      g_error_free(error);
+      goto done;
+    }
+    g_ptr_array_add(owned_strings, host);
+    cfg->endpoint.host = host;
+
+    error = NULL;
+    cfg->endpoint.port = g_key_file_get_integer(kf, "stream", "port", &error);
+    if (error) {
+      fprintf(stderr, "Config missing/invalid stream.port: %s\n", error->message);
+      g_error_free(error);
+      goto done;
+    }
+  } else {
+    cfg->endpoint.host = NULL;
+    cfg->endpoint.port = 0;
   }
 
   guint16 control_port = 8081;

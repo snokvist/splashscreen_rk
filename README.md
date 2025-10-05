@@ -36,8 +36,13 @@ illustrates every available section:
   - `input`: Path to an H.265 elementary stream file that contains repeated key
     frames.
   - `fps`: Frame rate of the input material (double).
-  - `host`: Destination IP for the RTP/UDP output.
-  - `port`: Destination UDP port.
+  - `outputs`: Optional comma-separated list of `udp` and/or `appsrc` outputs.
+    The default is `udp`. When `appsrc` is enabled the library exposes a
+    timestamped `GstAppSrc` via `splash_get_appsrc()` for applications that want
+    to feed the frames into their own pipelines.
+  - `host`: Destination IP for the RTP/UDP output (required when `udp` is
+    enabled).
+  - `port`: Destination UDP port (required when `udp` is enabled).
 - `[control]`
   - `port`: HTTP control port (defaults to `8081` if omitted).
   - `combo_loop_mode`: Controls how combo playlists repeat once the queue drains.
@@ -91,6 +96,15 @@ Splashscreen RK.
 - `GET /request/enqueue/<name>` — enqueue either a single sequence or a combo by
   name. When combos marked with `loop_at_end=true` are enqueued, they will
   repeat according to `combo_loop_mode` until the queue is updated.
+
+## Library Appsrc Output
+
+Projects embedding `splashlib` can request a direct application source instead
+of, or in addition to, the UDP sender. Set `stream.outputs=appsrc` (or
+`stream.outputs=udp,appsrc`) in the configuration and call
+`splash_get_appsrc()` to obtain a referenced `GstElement*`. The returned element
+is configured as live H.265 output using the configured framerate so it can be
+added to custom pipelines.
 
 ## License
 
